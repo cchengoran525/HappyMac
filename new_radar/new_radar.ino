@@ -119,6 +119,8 @@ void setup() {
 // ─── loop ────────────────────────────────────────────
 void loop() {
   // 读 LD2410C
+  r10_energy_m = 0;
+  r10_energy_s = 0;
   radar2410.read();
   r10_present  = radar2410.movingTargetDetected() ||
                  radar2410.stationaryTargetDetected();
