@@ -1,2 +1,7 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+# Auto detect text files and perform LF normalization
+* text=auto
+
+# 告诉 GitHub 这是外部示例代码，不纳入语言统计
+CameraWebServer/* linguist-vendored
