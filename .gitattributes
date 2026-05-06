@@ -1,5 +1,2 @@
 # Auto detect text files and perform LF normalization
 * text=auto
-
-# Exclude generated/vendored modules from GitHub language statistics
-CameraWebServer/* linguist-vendored
