@@ -117,13 +117,21 @@ HappyMac 的脸由三个层次构成：双眼、鼻子、嘴巴。当用户位�
 
 ## 当前进度
 
+### 硬件验证
 - [x] ESP32-C3 基础环境搭建
-- [x] SH1106 OLED 驱动，像素脸状态机（IDLE / WAKE / ACTIVE）
+- [x] SH1106 OLED 驱动（U8g2）
 - [x] LD2410C 跑通，微动能量读取正常
 - [x] SR602 红外传感器联通
 - [x] TP4056 双输入电源管理（USB-C + 太阳能）
-- [x] LD2450 跑通，X/Y 坐标解析正确
-- [ ] 双雷达五组件联合验证
+- [x] **LD2450 跑通，X/Y 坐标解析正确**
+  - 协议符号解码修正（bit15=1→正，bit15=0→负）
+  - EMA 滤波（α=0.3）消除慢漂
+  - 左/中/右分区检测 + 趋势箭头
+  - 串口 CSV 输出，可直接接入采集脚本
+  - ⚠️ 已知限制：LD2450 的 X 轴精度正比于距离。50cm 以内角分辨率恶化，仅"人在哪一侧"级别可用；≥1m 后左右追踪正常
+
+### 待完成
+- [ ] 双雷达分时复用（LD2410C + LD2450 交替采样，避免同频干扰）
 - [ ] 视觉辅助采集脚本（MediaPipe + 串口同步）
 - [ ] 模型 A / B 训练与部署
 - [ ] 视差跟随动画实现
@@ -135,17 +143,16 @@ HappyMac 的脸由三个层次构成：双眼、鼻子、嘴巴。当用户位�
 ## 文件结构
 
 ```
-happymac/
-├── firmware/
-│   ├── happymac_main/     # 主程序（状态机 + 动画）
-│   └── radar_test/        # 双雷达验证程序
-├── training/
-│   ├── collect.py         # 视觉辅助采集脚本
-│   ├── preprocess.py      # 数据预处理
-│   └── train.py           # 模型训练
-├── hardware/
-│   └── schematic/         # 电路图（待更新）
-└── README.md
+HappyMac/
+├── README.md
+├── new_radar/
+│   └── new_radar.ino      # 当前固件：LD2450 X/Y 解析 + EMA 滤波 + 左中右分区
+├── CameraWebServer/        # ESP32-CAM 官方示例（TinyML 训练阶段的"上帝视角"摄像头）
+│   ├── CameraWebServer.ino
+│   ├── app_httpd.cpp
+│   └── camera_pins.h
+└── firmware/               # 计划中：主程序（状态机 + 动画）
+└── training/               # 计划中：采集/预处理/训练脚本
 ```
 
 ---

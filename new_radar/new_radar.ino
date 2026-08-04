@@ -1,38 +1,58 @@
+// ============================================================
+//  HappyMac — new_radar.ino
+//  双雷达+红外验证固件（当前阶段：仅 LD2450）
+//
+//  功能：
+//    - LD2450 毫米波雷达 X/Y/速度 解析（协议正确解码）
+//    - EMA 滤波（α=0.3，平滑慢漂）
+//    - 左/中/右 分区检测（LEFT / CENTER / RIGHT）
+//    - 趋势箭头（← → ·）
+//    - OLED 实用显示 + 串口 CSV 采集输出
+//
+//  硬件：ESP32-C3 SuperMini + SH1106 OLED + LD2450 + SR602
+//  烧录：CDCOnBoot=cdc（必须！否则 USB 无串口输出）
+// ============================================================
+
 #include <Arduino.h>
 #include <Wire.h>
 #include <U8g2lib.h>
-#include <ld2410.h>
 #include <HardwareSerial.h>
 
-// ─── 引脚定义 ───────────────────────────────────────
+// ─── 引脚定义 ──────────────────────────────────────
 #define PIN_SDA       8
 #define PIN_SCL       9
-#define PIN_IR        5
-#define PIN_2410_RX   4
-#define PIN_2410_TX   3
+#define PIN_IR        5       // SR602 红外传感器
 #define PIN_2450_RX   20
 #define PIN_2450_TX   21
-#define RADAR_BAUD    256000
+#define RADAR_BAUD    256000  // LD2450 目标数据输出波特率
 
-// ─── 硬件对象 ───────────────────────────────────────
+// ─── 滤波参数 ──────────────────────────────────────
+#define EMA_ALPHA     0.3f    // EMA 系数（越大响应越快，越小越平滑）
+#define ZONE_LEFT      -200   // X < -200mm → LEFT
+#define ZONE_RIGHT     +200   // X > +200mm → RIGHT（中间为 CENTER）
+
+// ─── 硬件对象 ──────────────────────────────────────
 U8G2_SH1106_128X64_NONAME_F_HW_I2C oled(U8G2_R0, U8X8_PIN_NONE);
-ld2410 radar2410;
-HardwareSerial radar2450(0);  // UART0
+HardwareSerial radar2450(0);
 
-// ─── LD2410C 数据 ────────────────────────────────────
-bool  r10_present  = false;
-int   r10_dist     = 0;
-int   r10_energy_m = 0;
-int   r10_energy_s = 0;
+// ─── 雷达数据 ──────────────────────────────────────
+struct Target {
+  int16_t x, y, v;
+  bool    valid;
+  float   ema_x, ema_y;
+  bool    ema_ok;
+};
 
-// ─── LD2450 数据 ─────────────────────────────────────
-int16_t r50_x = 0, r50_y = 0, r50_speed = 0;
-bool    r50_valid = false;
+Target tg[3];           // LD2450 最多 3 目标
+int     best_slot = 0;  // 当前选中槽位
+float   trend_ema = 0;  // ΔX 的 EMA（用于趋势箭头）
+int     last_x = 0;
 
 uint8_t buf50[64];
 int     bufIdx = 0;
+uint32_t last_frame_ms = 0;
 
-// ─── LD2450 帧解析 ────────────────────────────────────
+// ─── 帧解析 ────────────────────────────────────────
 void parse2450() {
   while (radar2450.available()) {
     buf50[bufIdx++] = radar2450.read();
@@ -40,22 +60,41 @@ void parse2450() {
       if (buf50[0]==0xAA && buf50[1]==0xFF &&
           buf50[2]==0x03 && buf50[3]==0x00 &&
           buf50[28]==0x55 && buf50[29]==0xCC) {
-        r50_valid = false;
+
+        for (int t = 0; t < 3; t++) tg[t].valid = false;
+
         for (int t = 0; t < 3; t++) {
           int o = 4 + t * 8;
-          int16_t raw_x = buf50[o]   | buf50[o+1]<<8;
-          int16_t raw_y = buf50[o+2] | buf50[o+3]<<8;
-          int16_t raw_v = buf50[o+4] | buf50[o+5]<<8;
-          // 符号+数值解码
-          int x = (raw_x & 0x8000) ? -(raw_x & 0x7FFF) : (raw_x & 0x7FFF);
-          int y = (raw_y & 0x8000) ? -(raw_y & 0x7FFF) : (raw_y & 0x7FFF);
-          int v = (raw_v & 0x8000) ? -(raw_v & 0x7FFF) : (raw_v & 0x7FFF);
+          int16_t rx = buf50[o]   | buf50[o+1]<<8;
+          int16_t ry = buf50[o+2] | buf50[o+3]<<8;
+          int16_t rv = buf50[o+4] | buf50[o+5]<<8;
+
+          // HLK-LD2450 协议：bit15=1→正，bit15=0→负，低 15 位为幅值
+          // X/Y 单位 mm，速度单位 cm/s
+          int x = (rx & 0x8000) ?  (rx & 0x7FFF) : -(rx & 0x7FFF);
+          int y = (ry & 0x8000) ?  (ry & 0x7FFF) : -(ry & 0x7FFF);
+          int v = (rv & 0x8000) ?  (rv & 0x7FFF) : -(rv & 0x7FFF);
+
           if (!(x==0 && y==0)) {
-            r50_x = x; r50_y = y; r50_speed = v;
-            r50_valid = true;
-            break;
+            tg[t].x = x; tg[t].y = y; tg[t].v = v; tg[t].valid = true;
+            if (!tg[t].ema_ok) {
+              tg[t].ema_x = x; tg[t].ema_y = y; tg[t].ema_ok = true;
+            } else {
+              tg[t].ema_x = EMA_ALPHA * x + (1.0f-EMA_ALPHA) * tg[t].ema_x;
+              tg[t].ema_y = EMA_ALPHA * y + (1.0f-EMA_ALPHA) * tg[t].ema_y;
+            }
           }
         }
+
+        // 选择最佳槽位：优先选 Y 在 0.2~3m 且最近有速度的
+        best_slot = 0;
+        for (int t = 0; t < 3; t++) {
+          if (tg[t].valid && tg[t].y > 0 && tg[t].y < 3000) {
+            best_slot = t; break;  // 选第一个合理距离的目标
+          }
+        }
+
+        last_frame_ms = millis();
         bufIdx = 0;
       } else {
         memmove(buf50, buf50+1, --bufIdx);
@@ -63,132 +102,124 @@ void parse2450() {
     }
   }
 }
-// ─── setup ───────────────────────────────────────────
+
+// ─── setup ──────────────────────────────────────────
 void setup() {
   Serial.begin(115200);
 
   pinMode(PIN_IR, INPUT);
-
-  // OLED
   Wire.begin(PIN_SDA, PIN_SCL);
+
   oled.begin();
-  oled.setContrast(210);
+  oled.setContrast(200);
   oled.clearBuffer();
   oled.setFont(u8g2_font_6x10_tr);
-  oled.drawStr(20, 20, "HappyMac");
-  oled.drawStr(10, 36, "initializing...");
+  oled.drawStr(25, 28, "HappyMac");
+  oled.drawStr(10, 44, "booting...");
   oled.sendBuffer();
 
-  // LD2410C
-  Serial1.begin(RADAR_BAUD, SERIAL_8N1, PIN_2410_RX, PIN_2410_TX);
-  {
-    unsigned long t = millis() + 2000;
-    while (millis() < t) while (Serial1.available()) Serial1.read();
-  }
-  if (radar2410.begin(Serial1))
-    Serial.println("[2410] OK");
-  else
-    Serial.println("[2410] WARN: not responding");
-
-  // LD2450
   radar2450.begin(RADAR_BAUD, SERIAL_8N1, PIN_2450_RX, PIN_2450_TX);
-  {
-    unsigned long t = millis() + 2000;
-    while (millis() < t) while (radar2450.available()) radar2450.read();
-  }
-  // 在 setup() 的 flush 之后加这段
-// 发送"进入配置模式"指令
-  uint8_t enableCmd[] = {0xFD,0xFC,0xFB,0xFA,0x04,0x00,0xFF,0x00,0x01,0x00,0x04,0x03,0x02,0x01};
-  radar2450.write(enableCmd, sizeof(enableCmd));
-  delay(100);
+  delay(1000);
+  while (radar2450.available()) radar2450.read();
 
-// 发送"恢复出厂设置"
-  uint8_t resetCmd[] = {0xFD,0xFC,0xFB,0xFA,0x02,0x00,0xA2,0x00,0x04,0x03,0x02,0x01};
-  radar2450.write(resetCmd, sizeof(resetCmd));
-  delay(500);
-
-// 退出配置模式
-  uint8_t endCmd[] = {0xFD,0xFC,0xFB,0xFA,0x02,0x00,0xFE,0x00,0x04,0x03,0x02,0x01};
-  radar2450.write(endCmd, sizeof(endCmd));
-  delay(100);
-  Serial.println("[2450] OK");
-
-  Serial.println("[HappyMac] all components ready");
+  Serial.println("[HappyMac] ready");
+  Serial.println("CSV: ms,x_raw,y_raw,x_ema,y_ema,spd,zone,trend,ir");
 }
 
-// ─── loop ────────────────────────────────────────────
+// ─── loop ───────────────────────────────────────────
 void loop() {
-  // 读 LD2410C
-  r10_energy_m = 0;
-  r10_energy_s = 0;
-  radar2410.read();
-  r10_present  = radar2410.movingTargetDetected() ||
-                 radar2410.stationaryTargetDetected();
-  if (radar2410.movingTargetDetected()) {
-    r10_dist     = radar2410.movingTargetDistance();
-    r10_energy_m = radar2410.movingTargetEnergy();
-  } else if (radar2410.stationaryTargetDetected()) {
-    r10_dist     = radar2410.stationaryTargetDistance();
-    r10_energy_s = radar2410.stationaryTargetEnergy();
-  } else {
-    r10_dist = 0;
-  }
-
-  // 读 LD2450
   parse2450();
 
-  // IR
+  // 帧超时：500ms 无数据 → 所有目标失效
+  if (millis() - last_frame_ms > 500) {
+    for (int t = 0; t < 3; t++) tg[t].valid = false;
+  }
+
   bool irHi = (digitalRead(PIN_IR) == HIGH);
 
-  // ─── OLED 显示 ──────────────────────────────────
-  oled.clearBuffer();
-  oled.setFont(u8g2_font_6x10_tr);
+  // 取最佳槽位
+  Target &t0 = tg[best_slot];
+  bool ok = t0.valid;
 
-  char line[32];
+  // ─── 左中右分区 ─────────────────────────────────
+  const char* zone = "--";
+  if (ok) {
+    int xf = (int)t0.ema_x;
+    if      (xf < ZONE_LEFT)  zone = " L";
+    else if (xf > ZONE_RIGHT) zone = " R";
+    else                       zone = " C";
+  }
 
-  // 行1: LD2410C 存在 + 距离
-  if (r10_present)
-    snprintf(line, sizeof(line), "2410: YES %dcm", r10_dist);
-  else
-    snprintf(line, sizeof(line), "2410: ---");
-  oled.drawStr(0, 12, line);
+  // ─── 趋势箭头 ───────────────────────────────────
+  const char* trend = ".";
+  if (ok) {
+    int dx = t0.x - last_x;
+    last_x = t0.x;
+    trend_ema = 0.3f * dx + 0.7f * trend_ema;
+    if      (trend_ema >  30) trend = ">>";
+    else if (trend_ema >  10) trend = " >";
+    else if (trend_ema < -30) trend = "<<";
+    else if (trend_ema < -10) trend = " <";
+  }
 
-  // 行2: LD2410C 能量
-  snprintf(line, sizeof(line), "E: M=%d S=%d", r10_energy_m, r10_energy_s);
-  oled.drawStr(0, 24, line);
+  // ─── OLED 显示（5Hz）─────────────────────────────
+  static uint32_t oled_timer = 0;
+  if (millis() - oled_timer >= 200) {
+    oled_timer = millis();
+    oled.clearBuffer();
 
-  // 行3: LD2450 坐标
-  if (r50_valid)
-    snprintf(line, sizeof(line), "2450: X=%d Y=%d", r50_x, r50_y);
-  else
-    snprintf(line, sizeof(line), "2450: no target");
-  oled.drawStr(0, 36, line);
+    if (ok) {
+      // 第一行：分区 + 趋势 + IR
+      oled.setFont(u8g2_font_6x10_tr);
+      char line[32];
+      snprintf(line, sizeof(line), "%s %s IR:%s",
+        zone, trend, irHi ? "ON" : "--");
+      oled.drawStr(0, 8, line);
 
-  // 行4: LD2450 速度
-  if (r50_valid)
-    snprintf(line, sizeof(line), "Spd: %dmm/s", r50_speed);
-  else
-    snprintf(line, sizeof(line), "Spd: ---");
-  oled.drawStr(0, 48, line);
+      // 中间大字：滤波坐标
+      oled.setFont(u8g2_font_7x13B_tr);
+      snprintf(line, sizeof(line), "X%+4d", (int)t0.ema_x);
+      oled.drawStr(0, 26, line);
+      snprintf(line, sizeof(line), "Y%4d", (int)t0.ema_y);
+      oled.drawStr(64, 26, line);
 
-  // 行5: IR 状态 + 分隔
-  snprintf(line, sizeof(line), "IR: %s", irHi ? "HIGH" : "low");
-  oled.drawStr(0, 60, line);
+      // 速度
+      oled.setFont(u8g2_font_6x10_tr);
+      snprintf(line, sizeof(line), "V%+4d cm/s", t0.v);
+      oled.drawStr(0, 37, line);
 
-  // 右上角小点指示 LD2450 有无数据
-  if (r50_valid) oled.drawDisc(124, 6, 3);
-  else           oled.drawCircle(124, 6, 3);
+      // 俯视图（雷达在底部中央，X±1000mm, Y 0-2000mm）
+      oled.drawHLine(0, 55, 128);
+      oled.drawVLine(63, 42, 22);
+      oled.drawDisc(63, 62, 2);
+      int px = map(constrain((int)t0.ema_x, -1000, 1000), -1000, 1000, 0, 127);
+      int py = map(constrain((int)t0.ema_y, 0, 2000), 0, 2000, 63, 44);
+      oled.drawDisc(px, py, 2);
+      // 分区线
+      int lx = map(ZONE_LEFT,  -1000, 1000, 0, 127);
+      int rx = map(ZONE_RIGHT, -1000, 1000, 0, 127);
+      oled.drawVLine(lx, 56, 7);
+      oled.drawVLine(rx, 56, 7);
+    } else {
+      oled.setFont(u8g2_font_7x13B_tr);
+      oled.drawStr(10, 28, "no target");
+      oled.setFont(u8g2_font_6x10_tr);
+      oled.drawStr(10, 44, "waiting...");
+    }
 
-  oled.sendBuffer();
+    oled.sendBuffer();
+  }
 
-  // 串口也输出一份方便调试
-  Serial.printf("2410: %s %dcm | Em=%d Es=%d | 2450: X=%d Y=%d Spd=%d | IR=%s\n",
-    r10_present ? "YES" : "NO",
-    r10_dist,
-    r10_energy_m, r10_energy_s,
-    r50_x, r50_y, r50_speed,
-    irHi ? "HIGH" : "low"
-  );
+  // ─── 串口 CSV ─────────────────────────────────────
+  if (ok) {
+    Serial.printf("2450,%lu,%d,%d,%d,%d,%d,%s,%s,%d\n",
+      millis(),
+      t0.x, t0.y,
+      (int)t0.ema_x, (int)t0.ema_y,
+      t0.v,
+      zone, trend,
+      irHi ? 1 : 0);
+  }
 
   delay(100);
 }
