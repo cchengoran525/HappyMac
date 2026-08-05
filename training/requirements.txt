@@ -1,0 +1,11 @@
+# HappyMac TinyML 训练依赖
+# pip install -r requirements.txt
+
+numpy>=1.24
+scipy>=1.10
+scikit-learn>=1.3
+opencv-python>=4.8
+mediapipe>=0.10.0
+pyserial>=3.5
+tensorflow>=2.13
+matplotlib>=3.7

@@ -146,13 +146,84 @@ HappyMac 的脸由三个层次构成：双眼、鼻子、嘴巴。当用户位�
 HappyMac/
 ├── README.md
 ├── new_radar/
-│   └── new_radar.ino      # 当前固件：LD2450 X/Y 解析 + EMA 滤波 + 左中右分区
-├── CameraWebServer/        # ESP32-CAM 官方示例（TinyML 训练阶段的"上帝视角"摄像头）
-│   ├── CameraWebServer.ino
-│   ├── app_httpd.cpp
-│   └── camera_pins.h
+│   └── new_radar.ino      # 当前固件：双雷达同时采样 + OLED + 串口 CSV
+├── CameraWebServer/        # ESP32-CAM 示例（TinyML 训练期摄像头）
+├── training/
+│   ├── config.py           # 全局配置
+│   ├── collect.py          # 数据采集脚本
+│   ├── preprocess.py       # 特征工程 + 标签生成
+│   ├── train.py            # RF 验证 + MLP 训练 + 量化
+│   └── requirements.txt    # Python 依赖
 └── firmware/               # 计划中：主程序（状态机 + 动画）
-└── training/               # 计划中：采集/预处理/训练脚本
+```
+
+---
+
+## 已知限制与开放问题
+
+### 双雷达同频干扰
+
+LD2410C 和 LD2450 均在 24GHz ISM 频段工作，两台雷达同时开启时会产生**双向电磁干扰**：
+
+| 干扰方向 | 影响 |
+|----------|------|
+| LD2450 → LD2410C | 底噪抬高 3-10dB，远距离检测灵敏度下降 |
+| LD2410C → LD2450 | 相位干涉精度下降，X 轴坐标漂移加剧 |
+
+**无法通过软件分时解决：** 两个雷达模块均不支持休眠/唤醒指令。断电重启需要数秒的启动+校准时间，无法在采集周期（100ms）内完成切换。硬件 MOSFET 电源门控（AO3401 + GPIO）是实现真正分时的唯一方案，目前尚未实施。
+
+### X 轴精度与距离的耦合
+
+LD2450 的 X 坐标通过两天线相位干涉计算（天线基线 ~6mm）。X 精度正比于目标距离：
+- **< 0.5m：** X 基本为噪声，仅能做"左/中/右"粗分类
+- **0.5-1m：** X 可用但漂移显著（σ≈200-1000mm）
+- **> 1m：** 角分辨率进入可用区间
+
+### 学术界与实践空白
+
+在 **24GHz 低成本双雷达（<50 元）+ TinyML 跨模态蒸馏（视觉→雷达）** 这个细分领域，目前没有找到直接对标的论文或开源项目：
+
+- LD2410/LD2450 DIY 社区项目均使用纯阈值规则，无 ML
+- 60GHz+ 雷达的 TinyML 研究使用高分辨率热力图输入（CNN/Transformer），与本项目的 18 维时序标量特征（MLP）不可比
+- 唯一的相近硬件栈论文（DOAJ, 2024）做的是"雷达触发→ESP32-S3 推理人脸识别"，不是行为分类
+
+**本项目从数据采集到模型部署的完整跨模态蒸馏管线（collect.py → preprocess.py → train.py → C 头文件 → C3 推理）为自行设计，无成熟参考架构。**
+
+### TinyML 管线限制
+
+- **MediaPipe 标签质量**：训练标签来自 MediaPipe 面部网格的几何推导（头部位姿、注视方向），不是人工标注。标签存在系统性偏差
+- **ESP32-C3 推理性能**：RISC-V 核心无 SIMD 指令扩展，MLP 推理约 <10ms（2 层, <2K 参数），但无法运行 CNN 类模型。如需更复杂模型，需迁移至 ESP32-S3（ESP-NN 加速 42x）
+- **数据采集一次性**：相机仅存在于训练期。如果雷达安装位置/朝向改变，需要重新采集数据
+
+---
+
+## TinyML 管线
+
+```
+training/
+├── config.py           # 全局配置（特征列表、窗口参数、标签定义等）
+├── collect.py          # 数据采集：S3 视频流 + C3 串口 + MediaPipe 标注
+├── preprocess.py       # 特征工程：滑动窗口 + 18 维特征提取 + 标签生成
+├── train.py            # 训练：RF 快速验证 → MLP 训练 → INT8 量化 → C 头文件
+├── requirements.txt    # Python 依赖
+├── face_landmarker_v2_with_blendshapes.task  # MediaPipe 模型（首次运行时自动下载）
+├── sessions/           # 原始采集数据（CSV）
+└── models/             # 训练产物（.npy, .h5, .tflite, .h）
+```
+
+### 数据流
+
+```
+[采集]  collect.py
+  S3 MJPEG 视频流 ──→ MediaPipe Face Landmarker ──→ 头部位姿 + 注视方向 + 眼部开合
+  C3 USB 串口     ──→ LD2450(X/Y/V) + LD2410C(Em/Es) + SR602 ← 时间对齐 → 一行 CSV
+
+[处理]  preprocess.py
+  原始 CSV → 滑动窗口(2s/5s) → 18维特征向量 → 模型A标签(8类) + 模型B标签(8类)
+  → X_a.npy / y_a.npy / X_b.npy / y_b.npy
+
+[训练]  train.py
+  Random Forest 验证(准确率>85%才继续) → MLP(32→16→softmax) → INT8 量化 → model_*.h
 ```
 
 ---
