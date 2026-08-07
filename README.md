@@ -147,7 +147,8 @@ HappyMac/
 ├── README.md
 ├── new_radar/
 │   └── new_radar.ino      # 当前固件：双雷达同时采样 + OLED + 串口 CSV
-├── CameraWebServer/        # ESP32-CAM 示例（TinyML 训练期摄像头）
+├── s3_camera/
+│   └── s3_camera.ino        # S3 摄像头固件（/stream /capture /status /control）
 ├── training/
 │   ├── config.py           # 全局配置
 │   ├── collect.py          # 数据采集脚本
