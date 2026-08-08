@@ -36,7 +36,7 @@
 #define RADAR_BAUD    256000
 
 // ─── EMA ────────────────────────────────────────────
-#define EMA_A 0.3f
+#define EMA_A 0.55f   // 0.4→0.55, 响应~2帧(200ms)达63%
 
 // ─── 硬件 ──────────────────────────────────────────
 U8G2_SH1106_128X64_NONAME_F_HW_I2C oled(U8G2_R0, U8X8_PIN_NONE);
@@ -81,7 +81,40 @@ void parse2450(){
   }
 }
 
-// ─── setup ──────────────────────────────────────────
+// ─── 串口命令（电脑 → C3 OLED 显示）─────────────────
+char  cmd_phase[32] = "";
+int   cmd_countdown  = 0;
+int   cmd_state      = 0;  // 0=无, 1=倒计时, 2=开始, 3=完成
+uint32_t cmd_expiry  = 0;
+
+void checkCmd() {
+  while (Serial.available()) {
+    String s = Serial.readStringUntil('\n');
+    s.trim();
+    if (!s.startsWith("!")) continue;
+    s = s.substring(1);
+    if (s.startsWith("PHASE:")) {
+      // !PHASE:静止基线,3
+      int comma = s.indexOf(',');
+      if (comma > 0) {
+        String name = s.substring(6, comma);
+        name.toCharArray(cmd_phase, sizeof(cmd_phase));
+        cmd_countdown = s.substring(comma + 1).toInt();
+        cmd_state = 1;
+        cmd_expiry = millis() + 5000;
+      }
+    } else if (s == "GO") {
+      cmd_state = 2; cmd_expiry = millis() + 3000;
+    } else if (s == "DONE") {
+      cmd_state = 3; cmd_expiry = millis() + 2000;
+    } else if (s == "CLEAR") {
+      cmd_state = 0; cmd_phase[0] = 0;
+    }
+  }
+  if (cmd_state && millis() > cmd_expiry) {
+    cmd_state = 0;
+  }
+}
 void setup(){
   Serial.begin(115200);
   pinMode(PIN_IR,INPUT);
@@ -107,6 +140,9 @@ void setup(){
 
 // ─── loop ───────────────────────────────────────────
 void loop(){
+  // ── 读电脑发来的 OLED 命令 ──
+  checkCmd();
+
   // ── 读 LD2410C ──
   radar2410.read();
   r10_pres=radar2410.movingTargetDetected()||radar2410.stationaryTargetDetected();
@@ -123,36 +159,75 @@ void loop(){
   // ── IR ──
   bool ir=(digitalRead(PIN_IR)==HIGH);
 
-  // ── OLED（4Hz）──
+  // ── OLED（5Hz, 200ms）────────────────────────────
   static uint32_t ot=0;
-  if(millis()-ot>=250){
+  if(millis()-ot>=80){   // OLED 刷新 ~12Hz, 延迟 80ms
     ot=millis();
-    oled.clearBuffer(); oled.setFont(u8g2_font_6x10_tr); char line[32];
+    oled.clearBuffer();
+    char line[32];
 
     if(r50_ok){
-      snprintf(line,sizeof(line),"X%+4d Y%+4d V%+3d",(int)ema_x,(int)ema_y,r50_v);
-      oled.drawStr(0,8,line);
-      snprintf(line,sizeof(line),"Em%3d Es%3d D%3d",r10_em,r10_es,r10_dist);
-      oled.drawStr(0,20,line);
-      snprintf(line,sizeof(line),"pres:%c ir:%c",
-        r10_pres?'Y':'N',ir?'Y':'N');
-      oled.drawStr(0,32,line);
+      // 小字 raw 诊断
+      oled.setFont(u8g2_font_5x8_tr);
+      snprintf(line,sizeof(line),"raw X:%+4d Y:%4d V:%+3d", r50_x,r50_y,r50_v);
+      oled.drawStr(0, 6, line);
+      snprintf(line,sizeof(line),"Em:%3d Es:%3d D:%3d %s IR:%c",
+        r10_em,r10_es,r10_dist, r10_pres?"P":"-", ir?'Y':'N');
+      oled.drawStr(0, 13, line);
+
+      // 大字 EMA
       oled.setFont(u8g2_font_7x13B_tr);
-      snprintf(line,sizeof(line),"%s",r10_pres?"SOMEONE":"EMPTY");
-      oled.drawStr(10,52,line);
+      snprintf(line,sizeof(line),"X%+4d",(int)ema_x); oled.drawStr(0,30,line);
+      snprintf(line,sizeof(line),"Y%4d",(int)ema_y);  oled.drawStr(64,30,line);
+
+      // 速度
+      oled.setFont(u8g2_font_5x8_tr);
+      int dx=r50_x-(int)ema_x, dy=r50_y-(int)ema_y;
+      snprintf(line,sizeof(line),"V%+4d %s", r50_v,
+        (abs(dx)>80||abs(dy)>60||abs(r50_v)>10)?"MOVING":"steady");
+      oled.drawStr(0,40,line);
+
+      // 阶段覆盖（电脑发指令）或俯视图
+      if(cmd_state!=0){
+        oled.setFont(u8g2_font_6x10_tr); oled.drawStr(0,50,cmd_phase);
+        if(cmd_state==1){
+          snprintf(line,sizeof(line),"%d",cmd_countdown);
+          oled.setFont(u8g2_font_10x20_tn);
+          oled.drawStr(64-strlen(line)*5,53,line);
+        }else if(cmd_state==2){
+          oled.setFont(u8g2_font_7x13B_tr); oled.drawStr(10,58,">>> GO <<<");
+        }else if(cmd_state==3){
+          oled.setFont(u8g2_font_7x13B_tr); oled.drawStr(20,58,"DONE");
+        }
+      }else{
+        oled.drawHLine(0,53,128); oled.drawVLine(63,42,20); oled.drawDisc(63,62,2);
+        int lx=map(-200,-800,800,0,127), rx=map(200,-800,800,0,127);
+        oled.drawVLine(lx,56,6); oled.drawVLine(rx,56,6);
+        int prx=map(constrain(r50_x,-800,800),-800,800,0,127);
+        int pry=map(constrain(r50_y,0,2000),0,2000,63,44);
+        oled.drawPixel(prx-1,pry); oled.drawPixel(prx+1,pry);
+        oled.drawPixel(prx,pry-1); oled.drawPixel(prx,pry+1);
+        int pex=map(constrain((int)ema_x,-800,800),-800,800,0,127);
+        int pey=map(constrain((int)ema_y,0,2000),0,2000,63,44);
+        oled.drawDisc(pex,pey,2);
+      }
     }else{
-      oled.setFont(u8g2_font_7x13B_tr);
-      oled.drawStr(15,30,"no target");
+      oled.setFont(u8g2_font_7x13B_tr); oled.drawStr(15,28,"no target");
     }
     oled.sendBuffer();
   }
 
-  // ── 串口 CSV ──
-  Serial.printf("RADAR,%lu,%d,%d,%d,%d,%d,%d,%d,%d\n",
-    millis(),
-    r50_ok?r50_x:0, r50_ok?r50_y:0, r50_ok?r50_v:0,
-    r10_em, r10_es, r10_dist,
-    r10_pres?1:0, ir?1:0);
-
-  delay(100);
+  // ── 串口输出（非阻塞，缓冲区不足时自动跳过）──
+  static uint8_t serial_skip=0;
+  if(Serial && ++serial_skip>=2){  // 每 2 帧发一次，降低缓冲压力
+    serial_skip=0;
+    if(Serial.availableForWrite()>80){  // 确保有空间，避免阻塞
+      Serial.printf("RADAR,%lu,%d,%d,%d,%d,%d,%d,%d,%d\n",
+        millis(),
+        r50_ok?r50_x:0, r50_ok?r50_y:0, r50_ok?r50_v:0,
+        r10_em, r10_es, r10_dist,
+        r10_pres?1:0, ir?1:0);
+    }
+  }
+  delay(20);  // 30→20ms, 主循环 ~30Hz
 }

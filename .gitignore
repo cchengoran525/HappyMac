@@ -1,0 +1,7 @@
+.DS_Store
+training/.DS_Store
+training/bench_results/*.mp4
+training/bench_results/*.csv
+training/bench_results/*.png
+__pycache__/
+*.pyc

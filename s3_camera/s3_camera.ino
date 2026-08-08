@@ -259,12 +259,11 @@ void handleControl() {
 void setup() {
   Serial.begin(115200);
   delay(500);
-  Serial.println("\n\n[HappyMac] S3 Camera booting...");
-
   // ── LED ──
   #if LED_GPIO_NUM >= 0
   pinMode(LED_GPIO_NUM, OUTPUT);
-  digitalWrite(LED_GPIO_NUM, LOW);
+  // 快闪 3 次 = 启动
+  for(int i=0;i<3;i++){digitalWrite(LED_GPIO_NUM,HIGH);delay(100);digitalWrite(LED_GPIO_NUM,LOW);delay(200);}
   #endif
 
   // ── 摄像头 ──
@@ -296,45 +295,27 @@ void setup() {
 
   esp_err_t err = esp_camera_init(&cfg);
   if (err != ESP_OK) {
-    Serial.printf("[CAM] 初始化失败: 0x%x\n", err);
+    // 慢闪 = 相机失败
     #if LED_GPIO_NUM >= 0
-    while (1) { digitalWrite(LED_GPIO_NUM, !digitalRead(LED_GPIO_NUM)); delay(200); }
+    while (1) { digitalWrite(LED_GPIO_NUM, !digitalRead(LED_GPIO_NUM)); delay(500); }
     #else
-    while (1) { Serial.println("HALT"); delay(1000); }
+    while (1) { delay(1000); }
     #endif
   }
-  Serial.println("[CAM] OK");
+  // 快闪 2 次 = 相机 OK
+  #if LED_GPIO_NUM >= 0
+  for(int i=0;i<2;i++){digitalWrite(LED_GPIO_NUM,HIGH);delay(50);digitalWrite(LED_GPIO_NUM,LOW);delay(100);}
+  #endif
 
-  // 关掉 LED 闪光灯（如果引脚被复用的话）
   sensor_t* s = esp_camera_sensor_get();
-  s->set_vflip(s, 0);      // 不垂直翻转
-  s->set_hmirror(s, 0);    // 不镜像（如果画面反了就改这个）
+  s->set_vflip(s, 0);
+  s->set_hmirror(s, 0);
 
-  // ── WiFi ──
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
-  Serial.printf("[WiFi] 连接 %s", WIFI_SSID);
-  int wifi_retry = 0;
-  while (WiFi.status() != WL_CONNECTED && wifi_retry < 40) {
-    delay(500);
-    Serial.print(".");
-    wifi_retry++;
-  }
-
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.printf("\n[WiFi] 已连接 IP: %s\n", WiFi.localIP().toString().c_str());
-    #if LED_GPIO_NUM >= 0
-    digitalWrite(LED_GPIO_NUM, HIGH);
-    #endif
-
-    // mDNS（可选，浏览器输入 http://happymac.local）
-    if (MDNS.begin("happymac")) {
-      Serial.println("[mDNS] http://happymac.local");
-    }
-  } else {
-    Serial.println("\n[WiFi] 连接失败，启动 AP 模式");
-    WiFi.softAP("HappyMac-S3", "12345678");
-    Serial.printf("[AP] IP: %s\n", WiFi.softAPIP().toString().c_str());
-  }
+  // ── WiFi：直接开 AP，不连外部网络 ──
+  WiFi.softAP("HappyMac-S3", "12345678");
+  #if LED_GPIO_NUM >= 0
+  digitalWrite(LED_GPIO_NUM, HIGH);  // 常亮 = AP 已启动
+  #endif
 
   // ── HTTP 服务 ──
   server.on("/",        HTTP_GET, [](){ server.send_P(200, "text/html", INDEX_HTML); });

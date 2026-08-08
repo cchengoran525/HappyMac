@@ -120,18 +120,51 @@ HappyMac 的脸由三个层次构成：双眼、鼻子、嘴巴。当用户位�
 ### 硬件验证
 - [x] ESP32-C3 基础环境搭建
 - [x] SH1106 OLED 驱动（U8g2）
+  - OLED 显示：raw 诊断 + EMA 滤波大字 + 俯视图
+  - EMA α=0.55，端到端延迟 ~400ms（雷达 100ms + EMA 200ms + OLED 80ms）
 - [x] LD2410C 跑通，微动能量读取正常
 - [x] SR602 红外传感器联通
 - [x] TP4056 双输入电源管理（USB-C + 太阳能）
 - [x] **LD2450 跑通，X/Y 坐标解析正确**
   - 协议符号解码修正（bit15=1→正，bit15=0→负）
-  - EMA 滤波（α=0.3）消除慢漂
-  - 左/中/右分区检测 + 趋势箭头
-  - 串口 CSV 输出，可直接接入采集脚本
-  - ⚠️ 已知限制：LD2450 的 X 轴精度正比于距离。50cm 以内角分辨率恶化，仅"人在哪一侧"级别可用；≥1m 后左右追踪正常
+  - EMA 滤波（α=0.55）平滑显示
+  - 串口 CSV 输出（RADAR 格式，可直接接入采集脚本）
+  - OLED 阶段指令支持（电脑通过串口发 `!PHASE` 命令）
+  - ⚠️ **X 轴慢漂为硬件固有限制**（见下方"LD2450 X 轴漂移"章节）
+- [x] **S3 摄像头固件重写**（s3_camera.ino）
+  - AP 模式热点直连（HappyMac-S3 / 12345678）
+  - MJPEG /stream + /capture + /status + /control
+  - ESP32-S3-EYE 适配（16MB Flash / OPI PSRAM）
+
+### 实测发现
+
+#### LD2450 X 轴慢漂（已知硬件限制，非我们的 bug）
+
+- **帧间精度极高**：静止时相邻帧 ΔX 中位仅 1-2mm
+- **长时漂移显著**：8 秒内 X 可慢漂 300-500mm，与用户实际运动无关
+- **社区确认**：ESPHome/Home Assistant 社区大量相同报告——LD2450 对静止人体检测不可靠，多径反射造成"鬼影目标"，固件 still target 计数有已知 bug
+- **物理机制**：X 轴依赖 6.25mm 天线基线的相位干涉测角。在室内多径环境下，雷达的相位中心在人体的直达反射和墙面/桌面多径之间缓慢漂移。Y 轴（时间飞行法）不受此影响
+- **对 TinyML 的影响**：模型不应依赖 X 绝对值，应依赖 X 的趋势（slope）、速度（Doppler）、以及 LD2410C 的能量信号
+
+#### USB 供电噪声
+
+- **S3 和 C3 插同一台电脑时，C3 雷达数据严重劣化**（Yσ 从 29mm → 290mm）
+- **解决方案**：S3 用独立供电（充电头）或走 WiFi（AP 模式），不与 C3 共用 USB 总线
+
+#### LD2450 对旋转比对平移敏感
+
+- 转头时 Xσ=111mm、span=415mm，大于刻意左右移（55mm/261mm）
+- **原因**：身体旋转时雷达反射截面（RCS）的相位中心从胸口漂移到肩膀，在雷达看来等效于大幅位移
+- **对注意力检测是利好**：注意转移天然伴随身体微旋转
+
+#### 双雷达同频干扰
+
+- 待定量测试（需 3 轮 AB 对比实验）
+- 目前观测：干扰远小于 USB 供电噪声的影响
 
 ### 待完成
-- [ ] 双雷达分时复用（LD2410C + LD2450 交替采样，避免同频干扰）
+- [ ] 双雷达分时复用（LD2410C + LD2450，需硬件 MOSFET 门控）
+- [ ] 雷达极限探查实验（5 个距离 × 4 种行为 = Paper 1 数据）
 - [ ] 视觉辅助采集脚本（MediaPipe + 串口同步）
 - [ ] 模型 A / B 训练与部署
 - [ ] 视差跟随动画实现
@@ -146,16 +179,26 @@ HappyMac 的脸由三个层次构成：双眼、鼻子、嘴巴。当用户位�
 HappyMac/
 ├── README.md
 ├── new_radar/
-│   └── new_radar.ino      # 当前固件：双雷达同时采样 + OLED + 串口 CSV
+│   └── new_radar.ino        # C3 固件：双雷达采样 + EMA 滤波 + OLED + 串口 CSV + 阶段指令
 ├── s3_camera/
-│   └── s3_camera.ino        # S3 摄像头固件（/stream /capture /status /control）
+│   └── s3_camera.ino        # S3 固件：AP 热点 MJPEG /stream + /capture + /status + /control
+├── CameraWebServer/          # [参考] ESP32-CAM 官方示例，保留备用
 ├── training/
-│   ├── config.py           # 全局配置
-│   ├── collect.py          # 数据采集脚本
-│   ├── preprocess.py       # 特征工程 + 标签生成
-│   ├── train.py            # RF 验证 + MLP 训练 + 量化
-│   └── requirements.txt    # Python 依赖
-└── firmware/               # 计划中：主程序（状态机 + 动画）
+│   ├── README.md            # TinyML 管线设计文档 + 11个研究问题 + 3条Paper线
+│   ├── config.py            # 全局配置
+│   ├── collect.py           # 数据采集（MediaPipe + S3 MJPEG + C3 串口）
+│   ├── preprocess.py        # 特征工程 + 标签生成
+│   ├── train.py             # RF 验证 → MLP 训练 → INT8 量化 → C 头文件
+│   ├── live_test.py         # Webcam + 雷达同步测试
+│   ├── s3_test.py           # S3 MJPEG + 雷达同步采集
+│   ├── cam_test.py          # 摄像头 + 雷达同步录制（产出 mp4 + csv）
+│   ├── full_test.py         # ANSI TUI 完整基准测试
+│   ├── radar_bench.py       # 3配置×4阶段雷达基准
+│   ├── requirements.txt     # Python 依赖
+│   ├── sessions/            # 采集原始数据（.csv）
+│   ├── models/              # 训练产物（.npy / .h5 / .tflite / .h）
+│   └── bench_results/       # 基准测试结果（.json / .mp4 / .csv / .png）
+└── firmware/                # 计划中：主程序（状态机 + 动画）
 ```
 
 ---
