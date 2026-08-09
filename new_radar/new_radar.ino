@@ -35,8 +35,10 @@
 #define PIN_2450_TX   21
 #define RADAR_BAUD    256000
 
-// ─── EMA ────────────────────────────────────────────
-#define EMA_A 0.55f   // 0.4→0.55, 响应~2帧(200ms)达63%
+// ─── EMA 滤波 ──────────────────────────────────────
+#define EMA_A 0.55f
+float   flt_x=0, flt_y=0;
+bool    flt_ok=false;
 
 // ─── 硬件 ──────────────────────────────────────────
 U8G2_SH1106_128X64_NONAME_F_HW_I2C oled(U8G2_R0, U8X8_PIN_NONE);
@@ -46,8 +48,6 @@ HardwareSerial radar2450(0);
 // ─── LD2450 ─────────────────────────────────────────
 int16_t  r50_x=0, r50_y=0, r50_v=0;
 bool     r50_ok=false;
-float    ema_x=0, ema_y=0;
-bool     ema_init=false;
 uint32_t r50_last=0;
 
 // ─── LD2410C ────────────────────────────────────────
@@ -69,9 +69,14 @@ void parse2450(){
           int y=(ry&0x8000)?(ry&0x7FFF):-(ry&0x7FFF);
           int v=(rv&0x8000)?(rv&0x7FFF):-(rv&0x7FFF);
           if(!(x==0&&y==0)){
-            r50_x=x; r50_y=y; r50_v=v; r50_ok=true;
-            if(!ema_init){ema_x=x;ema_y=y;ema_init=true;}
-            else{ema_x=EMA_A*x+(1-EMA_A)*ema_x; ema_y=EMA_A*y+(1-EMA_A)*ema_y;}
+            r50_x= x; r50_y=y; r50_v=v; r50_ok=true;  // 竖放方向: 左小右大
+
+            // ── EMA 滤波 ──
+            if(!flt_ok){flt_x=x; flt_y=y; flt_ok=true;}
+            else{
+              flt_x=EMA_A*x+(1.0f-EMA_A)*flt_x;
+              flt_y=EMA_A*y+(1.0f-EMA_A)*flt_y;
+            }
             break;
           }
         }
@@ -109,6 +114,8 @@ void checkCmd() {
       cmd_state = 3; cmd_expiry = millis() + 2000;
     } else if (s == "CLEAR") {
       cmd_state = 0; cmd_phase[0] = 0;
+    } else if (s == "SYNC") {
+      Serial.printf("!SYNC,%lu\n", millis());  // 回复时间戳给电脑
     }
   }
   if (cmd_state && millis() > cmd_expiry) {
@@ -124,16 +131,27 @@ void setup(){
   oled.drawStr(15,20,"HappyMac"); oled.drawStr(0,36,"2-radar collect");
   oled.sendBuffer();
 
-  // LD2410C
+  // LD2410C — 配置高灵敏度
   Serial1.begin(RADAR_BAUD,SERIAL_8N1,PIN_2410_RX,PIN_2410_TX);
   {unsigned long t=millis()+2000; while(millis()<t) while(Serial1.available())Serial1.read();}
-  if(radar2410.begin(Serial1)) Serial.println("[2410] OK");
-  else Serial.println("[2410] WARN");
+  if(radar2410.begin(Serial1)){
+    Serial.println("[2410] OK");
+    // 拉高近距离 gate 灵敏度（桌面尺度用 gate 0-3 ≈ 0-2.25m）
+    delay(100);
+    for(int g=0;g<4;g++) radar2410.setGateSensitivityThreshold(g,80,80);
+    Serial.println("[2410] sensitivity: gates 0-3 = 80/80");
+  }else{Serial.println("[2410] WARN");}
 
   // LD2450
   radar2450.begin(RADAR_BAUD,SERIAL_8N1,PIN_2450_RX,PIN_2450_TX);
   {unsigned long t=millis()+2000; while(millis()<t) while(radar2450.available())radar2450.read();}
   Serial.println("[2450] OK");
+
+  // SYNC 标记（摄像头对齐用，采集脚本检测此标记）
+  for(int i=0;i<10;i++){
+    Serial.printf("!SYNC,%lu\n",millis());
+    delay(50);
+  }
 
   Serial.println("CSV: ms,x,y,v,em,es,d2410,pres,ir");
 }
@@ -143,14 +161,14 @@ void loop(){
   // ── 读电脑发来的 OLED 命令 ──
   checkCmd();
 
-  // ── 读 LD2410C ──
+  // ── 读 LD2410C（始终读双通道能量，不依赖检测标志）──
   radar2410.read();
   r10_pres=radar2410.movingTargetDetected()||radar2410.stationaryTargetDetected();
-  if(radar2410.movingTargetDetected()){
-    r10_em=radar2410.movingTargetEnergy(); r10_es=0; r10_dist=radar2410.movingTargetDistance();
-  }else if(radar2410.stationaryTargetDetected()){
-    r10_em=0; r10_es=radar2410.stationaryTargetEnergy(); r10_dist=radar2410.stationaryTargetDistance();
-  }else{r10_em=0;r10_es=0;r10_dist=0;}
+  r10_em=radar2410.movingTargetEnergy();
+  r10_es=radar2410.stationaryTargetEnergy();
+  if(radar2410.movingTargetDetected()) r10_dist=radar2410.movingTargetDistance();
+  else if(radar2410.stationaryTargetDetected()) r10_dist=radar2410.stationaryTargetDistance();
+  else r10_dist=0;
 
   // ── 读 LD2450 ──
   parse2450();
@@ -177,12 +195,12 @@ void loop(){
 
       // 大字 EMA
       oled.setFont(u8g2_font_7x13B_tr);
-      snprintf(line,sizeof(line),"X%+4d",(int)ema_x); oled.drawStr(0,30,line);
-      snprintf(line,sizeof(line),"Y%4d",(int)ema_y);  oled.drawStr(64,30,line);
+      snprintf(line,sizeof(line),"X%+4d",-(int)flt_x); oled.drawStr(0,30,line);  // OLED镜像
+      snprintf(line,sizeof(line),"Y%4d",(int)flt_y);  oled.drawStr(64,30,line);
 
       // 速度
       oled.setFont(u8g2_font_5x8_tr);
-      int dx=r50_x-(int)ema_x, dy=r50_y-(int)ema_y;
+      int dx=r50_x-(int)flt_x, dy=r50_y-(int)flt_y;
       snprintf(line,sizeof(line),"V%+4d %s", r50_v,
         (abs(dx)>80||abs(dy)>60||abs(r50_v)>10)?"MOVING":"steady");
       oled.drawStr(0,40,line);
@@ -203,12 +221,12 @@ void loop(){
         oled.drawHLine(0,53,128); oled.drawVLine(63,42,20); oled.drawDisc(63,62,2);
         int lx=map(-200,-800,800,0,127), rx=map(200,-800,800,0,127);
         oled.drawVLine(lx,56,6); oled.drawVLine(rx,56,6);
-        int prx=map(constrain(r50_x,-800,800),-800,800,0,127);
+        int prx=map(constrain(-r50_x,-800,800),-800,800,0,127);  // OLED镜像
         int pry=map(constrain(r50_y,0,2000),0,2000,63,44);
         oled.drawPixel(prx-1,pry); oled.drawPixel(prx+1,pry);
         oled.drawPixel(prx,pry-1); oled.drawPixel(prx,pry+1);
-        int pex=map(constrain((int)ema_x,-800,800),-800,800,0,127);
-        int pey=map(constrain((int)ema_y,0,2000),0,2000,63,44);
+        int pex=map(constrain(-(int)flt_x,-800,800),-800,800,0,127);  // OLED镜像
+        int pey=map(constrain((int)flt_y,0,2000),0,2000,63,44);
         oled.drawDisc(pex,pey,2);
       }
     }else{
