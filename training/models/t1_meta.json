@@ -1,0 +1,24 @@
+{
+  "sessions": [
+    "20260813_160414",
+    "20260813_165801",
+    "20260813_170609"
+  ],
+  "window_sec": 2.0,
+  "stride_sec": 0.5,
+  "n_samples": 1787,
+  "n_features": 12,
+  "class_distribution": {
+    "STILL": 1077,
+    "LATERAL": 612,
+    "RETREAT": 67,
+    "APPROACH": 31
+  },
+  "class_names": [
+    "ABSENT",
+    "STILL",
+    "LATERAL",
+    "APPROACH",
+    "RETREAT"
+  ]
+}
