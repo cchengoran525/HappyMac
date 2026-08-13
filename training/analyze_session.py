@@ -10,10 +10,14 @@ import matplotlib.pyplot as plt
 
 SESSION_DIR = Path(__file__).resolve().parent / "sessions"
 OUT_DIR = Path(__file__).resolve().parent / "analysis"
-SESSION_ID = "20260809_172535"
+SESSION_ID = "20260813_160414"
 csv_path = SESSION_DIR / f"session_{SESSION_ID}.csv"
 sum_path = SESSION_DIR / f"session_{SESSION_ID}_summary.json"
 OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+# ── 多 session 支持：所有 session_*.csv ──
+ALL_CSVS = sorted(SESSION_DIR.glob("session_*.csv"))
+print(f"发现 {len(ALL_CSVS)} 个 session: {[p.stem.replace('session_','') for p in ALL_CSVS]}")
 
 rows = list(csv.DictReader(open(csv_path)))
 summary = json.load(open(sum_path))

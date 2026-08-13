@@ -65,8 +65,10 @@ class SessionCollector:
         self.all_radar = []
         self.action_log = []
 
-        # Radar serial — active SYNC handshake
+        # Radar serial — 禁用 DTR/RTS 防止误复位 C3
         self.ser = serial.Serial(RADAR_PORT, 115200, timeout=0.3)
+        self.ser.setDTR(False)
+        self.ser.setRTS(False)
         time.sleep(1)
         self.sync_ts = time.time()
         self.ser.write(b'!SYNC\n')
@@ -78,6 +80,20 @@ class SessionCollector:
                 print(f"[SYNC] C3 replies: ms={self.sync_ms}")
                 break
         threading.Thread(target=self._radar_thread, daemon=True).start()
+
+        # ── 雷达预热 3 分钟（冷启动漂移期，已实测确认）──
+        print("\n[WARMUP] 雷达预热 180 秒（冷启动噪声期，请静置）")
+        t_warm = time.time()
+        while time.time() - t_warm < 180:
+            remaining = 180 - int(time.time() - t_warm)
+            print(f"\r[WARMUP] 剩余 {remaining:3d}s    ", end="", flush=True)
+            time.sleep(1)
+        print("\n[WARMUP] 完成，开始正式采集\n")
+
+        # 清空预热期积压的数据
+        while True:
+            try: self.radar_q.get_nowait()
+            except queue.Empty: break
 
         # S3 stream
         print(f"[S3] connecting {S3_URL}...")
@@ -95,6 +111,11 @@ class SessionCollector:
         self.csv_f = open(self.csv_path, 'w', newline='')
         self.csv_w = csv.writer(self.csv_f)
         self.csv_w.writerow(['t_global','x','y','v','em','es','action'])
+
+        # Video timestamp log（每帧的墙钟时间戳）
+        self.vid_ts_path = OUT_DIR / f"session_{ts}_vidts.csv"
+        self.vid_ts_f = open(self.vid_ts_path, 'w')
+        self.vid_ts_f.write("t_wallclock,action\n")
 
         self.t_start = time.time()
 
@@ -123,8 +144,9 @@ class SessionCollector:
         if a != -1 and b != -1 and b > a:
             jpg = self.stream_buf[a:b+2]
             self.stream_buf = self.stream_buf[b+2:]
-            return cv2.imdecode(np.frombuffer(jpg, np.uint8), cv2.IMREAD_COLOR)
-        return None
+            img = cv2.imdecode(np.frombuffer(jpg, np.uint8), cv2.IMREAD_COLOR)
+            return img, time.time()  # 墙钟时间戳！
+        return None, None
 
     def run_action(self, key, name, duration, desc):
         print(f"\n{'='*55}")
@@ -143,33 +165,33 @@ class SessionCollector:
         frame_count = 0
 
         while time.time() - t0 < duration:
-            # MJPEG frame
-            frame = self._read_mjpeg()
-            t_vid = time.time()
+            # MJPEG frame（带墙钟时间戳）
+            frame, t_vid = self._read_mjpeg()
 
-            # Drain radar
+            # Drain radar（保留雷达自己的到达时间戳）
             radar_latest = None
             while True:
                 try:
                     r = self.radar_q.get_nowait()
                     r['action'] = key
-                    r['t_global'] = t_vid
                     self.all_radar.append(r)
                     action_data.append(r)
                     radar_latest = r
                 except queue.Empty:
                     break
 
-            # Write CSV
+            # Write radar CSV（用雷达到达时间，不是视频时间！）
             if radar_latest:
-                # 时间戳相对于 SYNC 标记
-                t_rel = t_vid - self.sync_ts if self.sync_ts else t_vid - self.t_start
                 self.csv_w.writerow([
-                    f"{t_rel:.3f}",
+                    f"{radar_latest['t'] - (self.sync_ts or self.t_start):.3f}",
                     radar_latest['x'], radar_latest['y'],
                     radar_latest['v'], radar_latest['em'], radar_latest['es'],
                     key
                 ])
+
+            # Write video timestamp log（墙钟时间）
+            if frame is not None:
+                self.vid_ts_f.write(f"{t_vid:.6f},{key}\n")
 
             # Display
             if frame is not None:
@@ -235,19 +257,19 @@ class SessionCollector:
         self.oled("!CLEAR")
         self.stop.set()
 
-        # Save all radar data
+        # Save all radar data（用雷达线程记录的到达时间戳）
         self.csv_f.close()
-
-        # Re-save radar CSV properly
         with open(self.csv_path, 'w', newline='') as f:
             w = csv.writer(f)
             w.writerow(['t_global', 'x', 'y', 'v', 'em', 'es', 'action'])
+            t_ref = self.sync_ts or self.t_start
             for r in self.all_radar:
                 w.writerow([
-                    f"{r.get('t_global', self.sync_ts or self.t_start) - (self.sync_ts or self.t_start):.3f}",
+                    f"{r['t'] - t_ref:.3f}",
                     r['x'], r['y'], r['v'], r['em'], r['es'], r.get('action', '')
                 ])
 
+        self.vid_ts_f.close()
         self.writer.release()
         self.ser.close()
         cv2.destroyAllWindows()

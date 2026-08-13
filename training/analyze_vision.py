@@ -10,7 +10,8 @@ import mediapipe as mp
 
 SESSION_DIR = Path(__file__).resolve().parent / "sessions"
 OUT_DIR = Path(__file__).resolve().parent / "analysis"
-SESSION_ID = "20260809_172535"
+import sys
+SESSION_ID = sys.argv[1] if len(sys.argv) > 1 else "20260813_160414"
 
 video_path = SESSION_DIR / f"session_{SESSION_ID}.mp4"
 csv_path   = SESSION_DIR / f"session_{SESSION_ID}.csv"
@@ -53,6 +54,16 @@ options = FaceLandmarkerOptions(
     min_tracking_confidence=0.5, output_face_blendshapes=False)
 landmarker = FaceLandmarker.create_from_options(options)
 
+# ── Load video wall-clock timestamps ──
+vid_ts_path = SESSION_DIR / f"session_{SESSION_ID}_vidts.csv"
+if vid_ts_path.exists():
+    vid_rows = list(csv.DictReader(open(vid_ts_path)))
+    vid_ts = [float(r['t_wallclock']) for r in vid_rows]
+    print(f"视频时间戳: {len(vid_ts)} 帧 (墙钟)")
+else:
+    vid_ts = None
+    print("⚠️ 无 vidts 文件，退化为帧号/fps")
+
 # ── Process video ──
 cap = cv2.VideoCapture(str(video_path))
 fps = cap.get(cv2.CAP_PROP_FPS)
@@ -61,7 +72,6 @@ print(f"视频: {total_frames}帧 @ {fps:.0f}fps")
 
 face_data = []  # {t, head_x, head_y, head_z, head_yaw, face_cx}
 frame_idx = 0
-t0 = None
 
 while True:
     ret, frame = cap.read()
@@ -69,8 +79,11 @@ while True:
     # Flip vertically (camera was upside down)
     frame = cv2.flip(frame, -1)
 
-    if t0 is None: t0 = time.time()
-    t_elapsed = frame_idx / fps if fps > 0 else (time.time() - t0)
+    # 用墙钟时间戳（优先）或帧号/fps（退化）
+    if vid_ts is not None and frame_idx < len(vid_ts):
+        t_elapsed = vid_ts[frame_idx] - vid_ts[0] if vid_ts else frame_idx / max(fps, 1)
+    else:
+        t_elapsed = frame_idx / max(fps, 1)
 
     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
@@ -179,7 +192,7 @@ r3 = np.corrcoef(hy, es)[0, 1] if len(hy) > 2 else 0
 axes[2].set_title(f'Es vs Head Yaw (r={r3:.3f}) {"✅ orientation signal" if abs(r3)>0.15 else "⚠️ no signal"}')
 
 plt.tight_layout()
-fig.savefig(OUT_DIR / '07_vision_vs_radar.png', dpi=150)
+fig.savefig(OUT_DIR / f'07_vision_vs_radar_{SESSION_ID}.png', dpi=150)
 plt.close()
 
 # ═══════════════════════════════════════════════════════
@@ -201,7 +214,7 @@ for ax in axes:
                      step='mid', alpha=0.03)
 
 plt.tight_layout()
-fig.savefig(OUT_DIR / '08_camera_vs_radar_timeseries.png', dpi=150)
+fig.savefig(OUT_DIR / f'08_camera_vs_radar_timeseries_{SESSION_ID}.png', dpi=150)
 plt.close()
 
 # ═══════════════════════════════════════════════════════
@@ -217,7 +230,7 @@ ax1.set_title('Head Yaw (camera) vs Es (radar) — "Does turning head change rad
 l1, b1 = ax1.get_legend_handles_labels(); l2, b2 = ax2.get_legend_handles_labels()
 ax1.legend(l1 + l2, b1 + b2, fontsize=8)
 plt.tight_layout()
-fig.savefig(OUT_DIR / '09_yaw_vs_es.png', dpi=150)
+fig.savefig(OUT_DIR / f'09_yaw_vs_es_{SESSION_ID}.png', dpi=150)
 plt.close()
 
 # ── Summary ──
