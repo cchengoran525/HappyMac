@@ -247,6 +247,8 @@ T1b 已实现：ABSENT / STILL / LATERAL / APPROACH / RETREAT，融合训练 F1=
 
 ### 模型 A 实施状态
 
+- [x] C3 上先接入 Model A v0：LD2450 X 相对校准中心的 LEFT/CENTER/RIGHT 分区
+- [x] 使用进入/退出双阈值滞回，避免边界附近左右抖动；动画仍使用连续 look 值
 - [ ] collect_free.py 加校准段（10 秒记录 ref_x）+ 输出 L/C/R 标签
 - [ ] 特征脚本加 3 维位置特征（X_rel, |slope_X|, std_X）
 - [ ] RF 训练 3 类（预期高于 5 类状态模型）
