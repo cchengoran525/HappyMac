@@ -50,6 +50,18 @@
 #define DEBUG_ANIM_LOG_MS 100
 #define POSITION_ENTER_PX 170.0f
 #define POSITION_EXIT_PX  80.0f
+#define LOOK_MAX_PX       30.0f
+#define LOOK_NORMAL_PX    24.0f
+#define LOOK_NORMAL_INPUT 700.0f
+#define LOOK_EXTREME_INPUT 1400.0f
+#define BLINK_DURATION_MS 180
+#define EYE_WIDTH_PX      8
+#define EYE_MAX_HEIGHT_PX 14
+#define LOOK_DEADZONE_MM  80.0f
+#define LOOK_TARGET_ALPHA 0.08f
+#define LOOK_MOVE_ALPHA   0.06f
+#define LOOK_MAX_STEP_PX  0.55f
+#define ATTENTION_DRIFT_PX 1.5f
 
 U8G2_SH1106_128X64_NONAME_F_HW_I2C oled(U8G2_R0, U8X8_PIN_NONE);
 ld2410 radar2410;
@@ -139,6 +151,16 @@ float y_delta = 0;
 PositionClass model_a_position = POS_CENTER;
 PositionClass model_a_previous = POS_CENTER;
 float model_a_direction = 0.0f;
+float attention_offset = 0.0f;
+float attention_target = 0.0f;
+uint32_t attention_until = 0;
+uint32_t next_attention_at = 7000;
+uint8_t attention_sequence = 0;
+int8_t nose_direction = -1;  // 只改变底部横线方向，竖线保持不变
+bool blink_active = false;
+uint32_t blink_started = 0;
+uint32_t next_blink_at = 5200;
+uint8_t blink_sequence = 0;
 
 const char* positionClassName(PositionClass p) {
   switch (p) {
@@ -264,9 +286,18 @@ void updateModelA() {
     else if (delta > POSITION_ENTER_PX) model_a_position = POS_RIGHT;
   }
 
-  // 连续方向仍使用原始相对位置，分类只负责可解释的 LEFT/CENTER/RIGHT。
-  model_a_direction = constrain(-delta / 180.0f * 6.0f, -6.0f, 6.0f);
-  if (model_a_position == POS_CENTER && fabsf(delta) < POSITION_EXIT_PX) {
+  // 连续方向：正常移动覆盖最大幅度的约 80%，极端移动再软扩展到 OLED 边缘。
+  float magnitude = fabsf(delta);
+  float normal_part = constrain(magnitude / LOOK_NORMAL_INPUT, 0.0f, 1.0f);
+  float extreme_part = constrain(
+    (magnitude - LOOK_NORMAL_INPUT) /
+      (LOOK_EXTREME_INPUT - LOOK_NORMAL_INPUT), 0.0f, 1.0f);
+  float look_magnitude = normal_part * LOOK_NORMAL_PX +
+                         extreme_part * (LOOK_MAX_PX - LOOK_NORMAL_PX);
+  model_a_direction = (delta < 0.0f ? 1.0f : -1.0f) * look_magnitude;
+  if (fabsf(delta) < LOOK_DEADZONE_MM) {
+    model_a_direction = 0.0f;
+  } else if (model_a_position == POS_CENTER && fabsf(delta) < POSITION_EXIT_PX) {
     model_a_direction *= fabsf(delta) / POSITION_EXIT_PX;
   }
 
@@ -441,32 +472,85 @@ void updateState() {
 void updateAnimation() {
   updateModelA();
 
+  // 保留鼻子的左右方向性，但只切换底部横线，不翻转竖线。
+  if (model_a_position == POS_LEFT) nose_direction = -1;
+  else if (model_a_position == POS_RIGHT) nose_direction = 1;
+
   // 启动后以当前目标位置为中心，缓慢吸收 LD2450 的长期漂移。
   if (center_ok && !targetMoving() && state == HM_IDLE) {
     center_x = center_x * 0.995f + flt_x * 0.005f;
   }
 
-  // 原始 X 方向与 OLED 镜像方向一致，限幅后只作为“注意力方向”。
-  face_look_target = model_a_direction;
-  if (state == HM_SLEEP) face_look_target = 0;
-
   uint32_t now = millis();
   float phase = (now % 2600) / 2600.0f * 6.283185f;
   face_breath_target = (sinf(phase) + 1.0f) * 0.5f;
-  face_look += (face_look_target - face_look) * 0.15f;
+
+  // 人不动时偶尔做很小的注意力漂移；有明显运动时完全关闭。
+  bool calm = state == HM_IDLE && r50_ok && !targetMoving() &&
+              fabsf(model_a_direction) < 3.0f;
+  if (calm) {
+    if (attention_target == 0.0f &&
+        (int32_t)(now - next_attention_at) >= 0) {
+      attention_target = (attention_sequence++ & 1) ?
+        ATTENTION_DRIFT_PX : -ATTENTION_DRIFT_PX;
+      attention_until = now + 900;
+    } else if (attention_target != 0.0f && now >= attention_until) {
+      attention_target = 0.0f;
+      next_attention_at = now + 3600 + (attention_sequence % 5) * 500;
+    }
+  } else {
+    attention_target = 0.0f;
+    next_attention_at = now + 2200;
+  }
+  attention_offset += (attention_target - attention_offset) * 0.05f;
+
+  // 先平滑目标，再以限速方式移动整张脸，避免“到点式”跳转。
+  float desired_look = constrain(model_a_direction + attention_offset,
+                                 -LOOK_MAX_PX, LOOK_MAX_PX);
+  if (state == HM_SLEEP) desired_look = 0.0f;
+  face_look_target += (desired_look - face_look_target) * LOOK_TARGET_ALPHA;
+  float look_step = (face_look_target - face_look) * LOOK_MOVE_ALPHA;
+  face_look += constrain(look_step, -LOOK_MAX_STEP_PX, LOOK_MAX_STEP_PX);
   face_breath += (face_breath_target - face_breath) * 0.08f;
+
+  // 独立的短眨眼：不再用长时间取模条件造成“闭眼卡住”。
+  if (state == HM_SLEEP) {
+    blink_active = false;
+    next_blink_at = now + 1200;
+  } else if (!blink_active && (int32_t)(now - next_blink_at) >= 0) {
+    blink_active = true;
+    blink_started = now;
+  } else if (blink_active && now - blink_started >= BLINK_DURATION_MS) {
+    blink_active = false;
+    next_blink_at = now + 3800 + (blink_sequence++ % 5) * 550;
+  }
 }
 
-void drawEye(int cx, int cy, int open, int pupil_dx, bool sleepy) {
+void drawEye(int cx, int cy, int open, bool sleepy) {
+  // 麦金塔经典笑脸：眼睛宽度固定，只改变高度，不画瞳孔。
   if (sleepy || open <= 1) {
-    oled.drawLine(cx - 7, cy, cx + 7, cy);
+    oled.drawBox(cx - EYE_WIDTH_PX / 2, cy, EYE_WIDTH_PX, 2);
     return;
   }
-  int h = constrain(open, 4, 11);
-  oled.drawRBox(cx - 8, cy - h / 2, 16, h, 3);
-  oled.setDrawColor(0);
-  oled.drawDisc(cx + constrain(pupil_dx, -4, 4), cy, 3);
-  oled.setDrawColor(1);
+  int h = constrain(open, 2, EYE_MAX_HEIGHT_PX);
+  oled.drawRBox(cx - EYE_WIDTH_PX / 2, cy - h / 2,
+               EYE_WIDTH_PX, h, 1);
+}
+
+void drawMouth(int cx, bool smile) {
+  if (!smile) {
+    // 平嘴：厚度保持和微笑嘴主体接近。
+    oled.drawBox(cx - 14, 51, 28, 3);
+    return;
+  }
+
+  // 参考图的微笑嘴：整体要宽，两个小方角只是两端，不是主体。
+  // 横带约 32 px，整体宽约 44 px，接近截图中的比例。
+  oled.drawRBox(cx - 22, 46, 5, 5, 1);
+  oled.drawRBox(cx + 17, 46, 5, 5, 1);
+  oled.drawBox(cx - 16, 51, 32, 4);
+  oled.drawLine(cx - 17, 50, cx - 16, 51);
+  oled.drawLine(cx + 16, 51, cx + 17, 50);
 }
 
 void drawFace() {
@@ -485,11 +569,15 @@ void drawFace() {
     oled.setFont(u8g2_font_6x10_tr);
   }
 
-  int look = (int)face_look;
-  int eye_open = 8;
+  // 几何视差：整张脸共同平移，再改变五官相对位置，而不是只改变速度。
+  float look_ratio = constrain(face_look / LOOK_MAX_PX, -1.0f, 1.0f);
+  float eye_separation = 52.0f - 14.0f * fabsf(look_ratio);
+  int left_eye_x = (int)(64.0f + face_look - eye_separation * 0.5f);
+  int right_eye_x = (int)(64.0f + face_look + eye_separation * 0.5f);
+  int nose_x = (int)(64.0f + face_look + 7.0f * look_ratio);
+  int mouth_x = (int)(64.0f + face_look + 4.0f * look_ratio);
+  int eye_open = 12;
   bool sleepy = false;
-  bool surprised = false;
-  bool happy = false;
 
   switch (state) {
     case HM_SLEEP:
@@ -497,52 +585,47 @@ void drawFace() {
       eye_open = 1;
       break;
     case HM_GOODBYE:
-      eye_open = 5;
+      eye_open = 9;
       break;
     case HM_WAKING: {
       float p = constrain((now - state_since) / (float)WAKING_MS, 0.0f, 1.0f);
-      eye_open = (int)(2 + p * 8);
+      eye_open = (int)(3 + p * 10);
       break;
     }
     case HM_ACTIVE:
-      eye_open = 10;
-      happy = true;
+      eye_open = 13;
       break;
     case HM_APPROACH:
-      eye_open = 11;
-      surprised = true;
+      eye_open = 14;
       break;
     case HM_RETREAT:
-      eye_open = 5;
+      eye_open = 7;
       break;
     case HM_IDLE:
-      eye_open = 8;
+      eye_open = 11;
       break;
   }
 
-  int blink = ((now / 3700) % 17 == 0) ? 0 : eye_open;
-  int eye_y = 28 + (int)((face_breath - 0.5f) * 2.0f);
-  drawEye(38 + look, eye_y, blink, look * 0.35f, sleepy);
-  drawEye(90 + look, eye_y, blink, look * 0.35f, sleepy);
-
-  // 鼻子：前层移动最大。
-  if (!sleepy) oled.drawDisc(64 + look, 38, surprised ? 2 : 1);
-
-  // 嘴巴：不同状态使用简单像素表情。
-  if (sleepy) {
-    oled.drawLine(59, 47, 69, 47);
-  } else if (surprised) {
-    oled.drawCircle(64, 48, 4);
-  } else if (happy) {
-    oled.drawLine(57, 47, 61, 50);
-    oled.drawLine(61, 50, 67, 50);
-    oled.drawLine(67, 50, 71, 47);
-  } else if (state == HM_RETREAT || state == HM_GOODBYE) {
-    oled.drawLine(59, 50, 64, 48);
-    oled.drawLine(64, 48, 69, 50);
-  } else {
-    oled.drawLine(60, 49, 68, 49);
+  if (blink_active) {
+    uint32_t elapsed = now - blink_started;
+    float blink_scale;
+    if (elapsed < 55) blink_scale = 1.0f - elapsed / 55.0f;
+    else if (elapsed < 105) blink_scale = 0.0f;
+    else blink_scale = (elapsed - 105) / 75.0f;
+    eye_open = (int)(eye_open * constrain(blink_scale, 0.0f, 1.0f));
   }
+
+  int eye_y = 23;
+  drawEye(left_eye_x, eye_y, eye_open, sleepy);
+  drawEye(right_eye_x, eye_y, eye_open, sleepy);
+
+  // 固定的 J 形鼻子，和整张脸一起平移。
+  oled.drawBox(nose_x - 1, 26, 3, 13);
+  if (nose_direction < 0) oled.drawBox(nose_x - 7, 37, 8, 3);
+  else oled.drawBox(nose_x, 37, 8, 3);
+
+  // 不是所有状态都笑：ACTIVE 使用参考图的微笑嘴，其余状态多数为平嘴。
+  drawMouth(mouth_x, state == HM_ACTIVE);
 
   // 睡眠呼吸：亮度保持很低，但不完全熄灭。
   int contrast = state == HM_SLEEP ? 35 + (int)(face_breath * 20) : 170;

@@ -231,10 +231,10 @@ T1b 已实现：ABSENT / STILL / LATERAL / APPROACH / RETREAT，融合训练 F1=
               ↓                          ↓
         target_angle = P(R)×30° − P(L)×30°   （期望朝向角，可模糊）
               ↓
-        动画层（平滑插值 + 物理极限 + 视差分层）：
-        face_angle += (target − face) × α     ← α=0.15 缓动
-        face_angle = clamp(±30°)              ← 最大转头角
-        鼻=face×1.0, 眼=face×0.7, 嘴=face×0.4  ← 伪3D视差
+        动画层（死区 + 平滑限速 + 几何视差）：
+        face_target += (desired − target) × 0.08
+        face += clamp((target − face) × 0.06, ±0.55px)
+        整脸共同平移 + 眼距收缩 + 鼻/嘴相对偏移
               ↓
         OLED 20Hz 重绘
 ```
@@ -252,7 +252,7 @@ T1b 已实现：ABSENT / STILL / LATERAL / APPROACH / RETREAT，融合训练 F1=
 - [ ] collect_free.py 加校准段（10 秒记录 ref_x）+ 输出 L/C/R 标签
 - [ ] 特征脚本加 3 维位置特征（X_rel, |slope_X|, std_X）
 - [ ] RF 训练 3 类（预期高于 5 类状态模型）
-- [ ] C3 动画层实现（α 缓动 + 视差分层 + 20Hz OLED）
+- [x] C3 动画层实现（死区 + 限速跟随 + 几何视差 + 12.5Hz OLED）
 
 ## 关键验证关口
 
