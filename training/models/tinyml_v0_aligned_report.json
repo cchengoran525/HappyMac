@@ -1,0 +1,213 @@
+{
+  "dataset": {
+    "source": "5 rule aligned + 3 free aligned sessions",
+    "feature_names": [
+      "|slope_X|",
+      "slope_Y",
+      "std_X",
+      "std_Y",
+      "mean_Es",
+      "std_Es",
+      "mean_abs_V",
+      "max_abs_V",
+      "Es_edge"
+    ],
+    "class_names": [
+      "ABSENT",
+      "STILL",
+      "LATERAL",
+      "APPROACH",
+      "RETREAT"
+    ],
+    "window_sec": 2.0,
+    "stride_sec": 0.5,
+    "n_samples": 4744,
+    "detail": {
+      "20260813_160414": {
+        "still_30s": 72,
+        "slow_sweep": 50,
+        "quick_points": 50,
+        "ellipse": 50,
+        "fwd_back": 12,
+        "head_only": 50,
+        "natural_typing": 117,
+        "natural_reach": 50,
+        "stand_sit": 20
+      },
+      "20260813_165801": {
+        "still_30s": 72,
+        "slow_sweep": 50,
+        "quick_points": 50,
+        "ellipse": 50,
+        "fwd_back": 12,
+        "head_only": 50,
+        "natural_typing": 117,
+        "natural_reach": 50,
+        "stand_sit": 16
+      },
+      "20260813_170609": {
+        "still_30s": 72,
+        "slow_sweep": 50,
+        "quick_points": 50,
+        "ellipse": 50,
+        "fwd_back": 12,
+        "head_only": 50,
+        "natural_typing": 117,
+        "natural_reach": 50,
+        "stand_sit": 31
+      },
+      "20260822_183302": {
+        "still_30s": 62,
+        "slow_sweep": 50,
+        "quick_points": 50,
+        "ellipse": 50,
+        "fwd_back": 27,
+        "head_only": 50,
+        "natural_typing": 117,
+        "natural_reach": 50,
+        "stand_sit": 28
+      },
+      "20260822_191628": {
+        "still_30s": 72,
+        "slow_sweep": 50,
+        "quick_points": 50,
+        "ellipse": 50,
+        "fwd_back": 31,
+        "head_only": 50,
+        "natural_typing": 117,
+        "natural_reach": 50,
+        "stand_sit": 22
+      },
+      "20260813_200450": {
+        "free": 799
+      },
+      "20260822_190703": {
+        "free": 767
+      },
+      "20260822_192412": {
+        "free": 782
+      }
+    },
+    "counts": {
+      "ABSENT": 542,
+      "STILL": 2340,
+      "LATERAL": 945,
+      "APPROACH": 394,
+      "RETREAT": 523
+    }
+  },
+  "evaluation": {
+    "session_loso": [
+      {
+        "accuracy": 0.6093418259023354,
+        "macro_f1": 0.33462479470869183,
+        "held_out_session": "20260813_160414",
+        "n_test": 471
+      },
+      {
+        "accuracy": 0.6809421841541756,
+        "macro_f1": 0.39304029304029303,
+        "held_out_session": "20260813_165801",
+        "n_test": 467
+      },
+      {
+        "accuracy": 0.6161825726141079,
+        "macro_f1": 0.34756702695977637,
+        "held_out_session": "20260813_170609",
+        "n_test": 482
+      },
+      {
+        "accuracy": 0.6239669421487604,
+        "macro_f1": 0.37780925747348115,
+        "held_out_session": "20260822_183302",
+        "n_test": 484
+      },
+      {
+        "accuracy": 0.5752032520325203,
+        "macro_f1": 0.3619207948853286,
+        "held_out_session": "20260822_191628",
+        "n_test": 492
+      },
+      {
+        "accuracy": 0.49937421777221525,
+        "macro_f1": 0.3985952164727822,
+        "held_out_session": "20260813_200450",
+        "n_test": 799
+      },
+      {
+        "accuracy": 0.4784876140808344,
+        "macro_f1": 0.41478462792657267,
+        "held_out_session": "20260822_190703",
+        "n_test": 767
+      },
+      {
+        "accuracy": 0.5358056265984654,
+        "macro_f1": 0.44379259708881647,
+        "held_out_session": "20260822_192412",
+        "n_test": 782
+      }
+    ],
+    "session_loso_overall": {
+      "accuracy": 0.5632377740303541,
+      "macro_f1": 0.4620531790880019
+    },
+    "session_loso_confusion_matrix": [
+      [
+        314,
+        25,
+        102,
+        27,
+        74
+      ],
+      [
+        35,
+        1584,
+        309,
+        151,
+        261
+      ],
+      [
+        8,
+        223,
+        570,
+        67,
+        77
+      ],
+      [
+        21,
+        146,
+        87,
+        71,
+        69
+      ],
+      [
+        52,
+        196,
+        92,
+        50,
+        133
+      ]
+    ],
+    "rule_to_free": {
+      "accuracy": 0.4080068143100511,
+      "macro_f1": 0.24527003209049186
+    }
+  },
+  "model": {
+    "type": "RandomForestClassifier",
+    "n_estimators": 120,
+    "max_depth": 8,
+    "feature_names": [
+      "|slope_X|",
+      "slope_Y",
+      "std_X",
+      "std_Y",
+      "mean_Es",
+      "std_Es",
+      "mean_abs_V",
+      "max_abs_V",
+      "Es_edge"
+    ],
+    "model_file": "tinyml_v0_aligned_rf.pkl"
+  }
+}

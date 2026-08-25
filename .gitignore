@@ -6,3 +6,8 @@ training/bench_results/*.png
 __pycache__/
 *.pyc
 .Rhistory
+
+# 原始采集数据保留本地，不进入 GitHub
+training/sessions/*.mp4
+training/sessions/*.csv
+training/sessions/*.json

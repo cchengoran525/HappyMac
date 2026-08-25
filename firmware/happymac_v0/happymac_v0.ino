@@ -62,6 +62,11 @@
 #define LOOK_MOVE_ALPHA   0.06f
 #define LOOK_MAX_STEP_PX  0.55f
 #define ATTENTION_DRIFT_PX 1.5f
+#define Y_TREND_SAMPLE_MS 140
+#define Y_TREND_ALPHA     0.28f
+#define Y_TREND_TRIGGER_MM 8.0f
+#define TRANSIENT_HOLD_MS 900
+#define TRANSIENT_COOLDOWN_MS 400
 
 U8G2_SH1106_128X64_NONAME_F_HW_I2C oled(U8G2_R0, U8X8_PIN_NONE);
 ld2410 radar2410;
@@ -77,6 +82,10 @@ bool filter_ok = false;
 float center_x = 0;
 bool center_ok = false;
 uint32_t r50_seq = 0;
+float y_trend_sample = 0;
+float y_step_filtered = 0;
+uint32_t y_trend_sample_at = 0;
+bool y_trend_ready = false;
 
 struct MlSample {
   uint32_t t;
@@ -157,6 +166,8 @@ uint32_t attention_until = 0;
 uint32_t next_attention_at = 7000;
 uint8_t attention_sequence = 0;
 int8_t nose_direction = -1;  // 只改变底部横线方向，竖线保持不变
+uint32_t transient_until = 0;
+uint32_t transient_cooldown_until = 0;
 bool blink_active = false;
 uint32_t blink_started = 0;
 uint32_t next_blink_at = 5200;
@@ -261,6 +272,26 @@ bool stableTargetPresent() {
 bool targetMoving() {
   return abs(r50_v) > 10 || abs(r50_x - (int)flt_x) > 80 ||
          abs(r50_y - (int)flt_y) > 60;
+}
+
+void updateYTrend(uint32_t now) {
+  if (!r50_ok) {
+    y_trend_ready = false;
+    y_step_filtered = 0.0f;
+    return;
+  }
+  if (!y_trend_ready) {
+    y_trend_sample = flt_y;
+    y_trend_sample_at = now;
+    y_trend_ready = true;
+    return;
+  }
+  if (now - y_trend_sample_at < Y_TREND_SAMPLE_MS) return;
+
+  float step = flt_y - y_trend_sample;
+  y_step_filtered += (step - y_step_filtered) * Y_TREND_ALPHA;
+  y_trend_sample = flt_y;
+  y_trend_sample_at = now;
 }
 
 const char* positionLabel() {
@@ -424,6 +455,7 @@ void changeState(HappyState next) {
 
 void updateState() {
   uint32_t now = millis();
+  updateYTrend(now);
   bool present = stableTargetPresent();
 
   if (present) {
@@ -442,6 +474,30 @@ void updateState() {
   if (!present) return;
   if (state == HM_WAKING && now - state_since < WAKING_MS) return;
 
+  // 事件状态最小保持时间：保证 APPROACH/RETREAT 至少能被看见。
+  if ((state == HM_APPROACH || state == HM_RETREAT) &&
+      now < transient_until) {
+    return;
+  }
+
+  // 先处理经过滤波的 Y 趋势，再让普通状态模型接管，避免 APPROACH
+  // 刚触发就被 ACTIVE/IDLE 覆盖。
+  y_delta = y_step_filtered;
+  if (r50_ok && now >= transient_cooldown_until &&
+      y_step_filtered < -Y_TREND_TRIGGER_MM) {
+    changeState(HM_APPROACH);
+    transient_until = now + TRANSIENT_HOLD_MS;
+    transient_cooldown_until = transient_until + TRANSIENT_COOLDOWN_MS;
+    return;
+  }
+  if (r50_ok && now >= transient_cooldown_until &&
+      y_step_filtered > Y_TREND_TRIGGER_MM) {
+    changeState(HM_RETREAT);
+    transient_until = now + TRANSIENT_HOLD_MS;
+    transient_cooldown_until = transient_until + TRANSIENT_COOLDOWN_MS;
+    return;
+  }
+
   // T1b v0 先接管较稳定的 ABSENT/STILL/LATERAL；左右位置仍由
   // LD2450 规则控制，APPROACH/RETREAT 留给 Y 趋势规则兜底。
   if (ml_stable <= 4) {
@@ -455,16 +511,6 @@ void updateState() {
     }
   }
 
-  // LD2450 Y 越小通常代表越近。只使用窗口趋势，不信任单帧绝对值。
-  y_delta = flt_y - prev_y;
-  if (r50_ok && y_delta < -7 && targetMoving()) {
-    changeState(HM_APPROACH);
-    return;
-  }
-  if (r50_ok && y_delta > 7 && targetMoving()) {
-    changeState(HM_RETREAT);
-    return;
-  }
   if (targetMoving()) changeState(HM_ACTIVE);
   else if (now - state_since > STATE_HOLD_MS) changeState(HM_IDLE);
 }

@@ -50,9 +50,6 @@ ACTIONS = [
     ("stand_sit",       "STAND <> SIT",     20,
      "Stand up(3s)→sit(3s)→stand→sit. Repeat."),
 
-    # 自由
-    ("free_5min",       "FREE 5 MIN",      300,
-     "Do whatever you want. Use computer, stand, walk, leave, return."),
 ]
 
 # ═══════════════════════════════════════════════════════
