@@ -14,6 +14,8 @@
 //   RETREAT 目标距离变远，目送
 //
 // 左右跟随不是状态，而是连续的 faceLook 参数，避免表情跳变。
+// 睡前过渡链（一次性事件动画）：无人 2.5s 后 打哈欠→揉眼→渐暗→入睡，
+// 期间有人回来随时打断。事件只做帧内表情覆盖，不锁状态。
 // ============================================================
 
 #include <Arduino.h>
@@ -45,7 +47,8 @@
 #define ML_WINDOW_MS  2000
 #define ML_MIN_SAMPLES 20
 #define ML_RING_CAP   64
-#define ML_CONFIRM_MS 900
+#define ML_CONFIRM_MS 2000
+#define V_NOISE_FLOOR 8.0f
 #define PRESENCE_DEBOUNCE_MS 500
 #define DEBUG_ANIM_LOG_MS 100
 #define POSITION_ENTER_PX 170.0f
@@ -64,9 +67,24 @@
 #define ATTENTION_DRIFT_PX 1.5f
 #define Y_TREND_SAMPLE_MS 140
 #define Y_TREND_ALPHA     0.28f
-#define Y_TREND_TRIGGER_MM 8.0f
+#define Y_TREND_TRIGGER_MM 15.0f
+#define Y_TREND_RELEASE_MM 6.0f   // 事件后趋势回落到此值以内才重新武装
 #define TRANSIENT_HOLD_MS 900
 #define TRANSIENT_COOLDOWN_MS 400
+// 运动判定：近距静态噪声 σ≈100mm，单帧硬阈值必然误触发。改为逐帧证据
+// 积分 + 进入/退出双阈值，进入要连续多帧证据，退出要持续安静。
+#define MOTION_SPEED_TH   15.0f    // 滤波速度阈值，放在静态噪声带之上
+#define MOTION_REF_MS     700      // 位移参考点的采样间隔
+#define MOTION_DELTA_MM   130.0f   // 参考间隔内滤波位移超过此值算一份移动证据
+#define MOTION_SCORE_MAX  8
+#define MOTION_ENTER_SCORE 4       // 连续约 0.5s 的证据才进入“在动”
+#define MOTION_EXIT_SCORE  1       // 持续安静后才退出“在动”
+#define SMILE_ENTER_MS    600      // ACTIVE 持续这么久嘴才笑：短暂误进不闪嘴
+#define SMILE_MIN_MS      1500     // 笑容最短保持时间，防止嘴型反复横跳
+#define BEDTIME_YAWN_AT   2500     // 无人 2.5s 后开始睡前链（在 GOODBYE 目送之后）
+#define BEDTIME_YAWN_MS   2000
+#define BEDTIME_RUB_MS    1500
+#define BEDTIME_DIM_MS    1200     // 渐暗结束转 SLEEP（合计 last_seen+7.2s，早于 8s 兜底）
 
 U8G2_SH1106_128X64_NONAME_F_HW_I2C oled(U8G2_R0, U8X8_PIN_NONE);
 ld2410 radar2410;
@@ -86,6 +104,12 @@ float y_trend_sample = 0;
 float y_step_filtered = 0;
 uint32_t y_trend_sample_at = 0;
 bool y_trend_ready = false;
+bool y_trend_armed = true;
+float flt_v = 0;
+float motion_ref_x = 0, motion_ref_y = 0;
+uint32_t motion_ref_at = 0;
+int8_t motion_score = 0;
+bool motion_stable = false;
 
 struct MlSample {
   uint32_t t;
@@ -172,6 +196,24 @@ bool blink_active = false;
 uint32_t blink_started = 0;
 uint32_t next_blink_at = 5200;
 uint8_t blink_sequence = 0;
+uint32_t smile_until = 0;
+uint32_t smile_pending_since = 0;
+
+// 一次性事件动画：帧内覆盖表情，播完回姿态层，不锁状态。
+enum OneShotEv { EV_NONE, EV_YAWN, EV_RUB, EV_DIM };
+OneShotEv ev_cur = EV_NONE;
+uint32_t ev_started = 0;
+int mouth_mode = 0;   // 0 平嘴 1 微笑 2 哈欠
+int eye_wiggle = 0;
+
+const char* evName(OneShotEv e) {
+  switch (e) {
+    case EV_YAWN: return "YAWN";
+    case EV_RUB:  return "RUB";
+    case EV_DIM:  return "DIM";
+    default:      return "-";
+  }
+}
 
 const char* positionClassName(PositionClass p) {
   switch (p) {
@@ -192,6 +234,34 @@ const char* stateName(HappyState s) {
     case HM_RETREAT:  return "RETREAT";
   }
   return "UNKNOWN";
+}
+
+// 每收到一帧有效雷达报告积分一次运动证据：单帧噪声只贡献 ±1，
+// 真实移动会连续累积，跨过进入阈值后才切换运动状态。
+void updateMotionEvidence() {
+  uint32_t now = millis();
+  if (motion_ref_at == 0) {
+    motion_ref_x = flt_x;
+    motion_ref_y = flt_y;
+    motion_ref_at = now;
+    return;
+  }
+  bool evidence = fabsf(flt_v) > MOTION_SPEED_TH ||
+                  fabsf(flt_x - motion_ref_x) > MOTION_DELTA_MM ||
+                  fabsf(flt_y - motion_ref_y) > MOTION_DELTA_MM;
+  motion_score += evidence ? 1 : -1;
+  if (motion_score < 0) motion_score = 0;
+  if (motion_score > MOTION_SCORE_MAX) motion_score = MOTION_SCORE_MAX;
+  if (!motion_stable && motion_score >= MOTION_ENTER_SCORE) {
+    motion_stable = true;
+  } else if (motion_stable && motion_score <= MOTION_EXIT_SCORE) {
+    motion_stable = false;
+  }
+  if (now - motion_ref_at >= MOTION_REF_MS) {
+    motion_ref_x = flt_x;
+    motion_ref_y = flt_y;
+    motion_ref_at = now;
+  }
 }
 
 void parse2450() {
@@ -215,11 +285,13 @@ void parse2450() {
             r50_x = x; r50_y = y; r50_v = v; r50_ok = true;
             if (!filter_ok) {
               flt_x = x; flt_y = y; prev_y = y;
+              flt_v = v;
               filter_ok = true;
             } else {
               prev_y = flt_y;
               flt_x = EMA_A * x + (1.0f - EMA_A) * flt_x;
               flt_y = EMA_A * y + (1.0f - EMA_A) * flt_y;
+              flt_v = 0.35f * v + 0.65f * flt_v;
             }
             if (!center_ok) {
               center_x = flt_x;
@@ -230,6 +302,7 @@ void parse2450() {
         }
         r50_last = millis();
         r50_seq++;
+        updateMotionEvidence();
         frame_i = 0;
       } else {
         memmove(frame_buf, frame_buf + 1, --frame_i);
@@ -248,6 +321,11 @@ void readSensors() {
 
   parse2450();
   if (r50_ok && millis() - r50_last > 500) r50_ok = false;
+  // 雷达失联时让运动证据自然衰减，避免运动状态挂在过期数据上。
+  if (!r50_ok && motion_score > 0) {
+    motion_score--;
+    if (motion_stable && motion_score <= MOTION_EXIT_SCORE) motion_stable = false;
+  }
 }
 
 bool targetPresent() {
@@ -270,8 +348,9 @@ bool stableTargetPresent() {
 }
 
 bool targetMoving() {
-  return abs(r50_v) > 10 || abs(r50_x - (int)flt_x) > 80 ||
-         abs(r50_y - (int)flt_y) > 60;
+  // 已经是积分 + 滞回后的稳定判定，单帧噪声不再直接翻动状态。
+  if (!r50_ok) return false;
+  return motion_stable;
 }
 
 void updateYTrend(uint32_t now) {
@@ -380,7 +459,11 @@ void updateTinyML() {
     uint8_t idx = (ml_head + ML_RING_CAP - ml_count + first + j) % ML_RING_CAP;
     const MlSample &s = ml_ring[idx];
     float k = (float)j;
+    // v 噪声底：静态/微动时雷达 v 在 ±8 内抖（含 8 的倍数毛刺）。减掉噪声底后，
+    // typing/head 微动不再把 mean_abs_v 顶过树的 LATERAL 门限；
+    // 真实横移仍由 slope/std_X 位移特征驱动，快动作远高于噪声底不受影响。
     float afv = fabsf((float)s.v);
+    afv = afv > V_NOISE_FLOOR ? afv - V_NOISE_FLOOR : 0.0f;
     sum_k += k;
     sum_k2 += k * k;
     sum_x += s.x;
@@ -459,6 +542,7 @@ void updateState() {
   bool present = stableTargetPresent();
 
   if (present) {
+    ev_cur = EV_NONE;   // 人回来了：睡前链等一次性事件立刻打断
     last_seen = now;
     if (!had_target || state == HM_SLEEP || state == HM_GOODBYE) {
       had_target = true;
@@ -466,8 +550,23 @@ void updateState() {
     }
   } else if (had_target && now - last_seen < ABSENT_MS) {
     if (state != HM_GOODBYE && state != HM_SLEEP) changeState(HM_GOODBYE);
+    // 睡前过渡链：打哈欠→揉眼→渐暗→入睡；期间有人回来随时打断
+    uint32_t since = now - last_seen;
+    uint32_t tR = BEDTIME_YAWN_AT + BEDTIME_YAWN_MS,
+             tD = tR + BEDTIME_RUB_MS, tEnd = tD + BEDTIME_DIM_MS;
+    if (since >= BEDTIME_YAWN_AT) {
+      OneShotEv want = since < tR ? EV_YAWN : since < tD ? EV_RUB : EV_DIM;
+      if (ev_cur != want) {
+        ev_cur = want; ev_started = now;
+        if (Serial && Serial.availableForWrite() > 64) {
+          Serial.printf("EV,%lu,%s\n", millis(), evName(ev_cur));
+        }
+      }
+      if (since >= tEnd) { had_target = false; ev_cur = EV_NONE; changeState(HM_SLEEP); }
+    }
   } else if (had_target && now - last_seen >= ABSENT_MS) {
     had_target = false;
+    ev_cur = EV_NONE;
     changeState(HM_SLEEP);
   }
 
@@ -481,18 +580,24 @@ void updateState() {
   }
 
   // 先处理经过滤波的 Y 趋势，再让普通状态模型接管，避免 APPROACH
-  // 刚触发就被 ACTIVE/IDLE 覆盖。
+  // 刚触发就被 ACTIVE/IDLE 覆盖。趋势事件带武装滞回：触发后必须等
+  // 趋势回落到噪声带以内才重新武装，否则阈值附近徘徊会连环触发。
   y_delta = y_step_filtered;
-  if (r50_ok && now >= transient_cooldown_until &&
+  if (!y_trend_armed && fabsf(y_step_filtered) < Y_TREND_RELEASE_MM) {
+    y_trend_armed = true;
+  }
+  if (r50_ok && y_trend_armed && now >= transient_cooldown_until &&
       y_step_filtered < -Y_TREND_TRIGGER_MM) {
     changeState(HM_APPROACH);
+    y_trend_armed = false;
     transient_until = now + TRANSIENT_HOLD_MS;
     transient_cooldown_until = transient_until + TRANSIENT_COOLDOWN_MS;
     return;
   }
-  if (r50_ok && now >= transient_cooldown_until &&
+  if (r50_ok && y_trend_armed && now >= transient_cooldown_until &&
       y_step_filtered > Y_TREND_TRIGGER_MM) {
     changeState(HM_RETREAT);
+    y_trend_armed = false;
     transient_until = now + TRANSIENT_HOLD_MS;
     transient_cooldown_until = transient_until + TRANSIENT_COOLDOWN_MS;
     return;
@@ -505,7 +610,9 @@ void updateState() {
       changeState(HM_ACTIVE);
       return;
     }
-    if (ml_stable == 1 && now - state_since > STATE_HOLD_MS) {
+    // ML 判 STILL 时若规则运动积分器正在报警，放行给规则路径：
+    // 慢速大幅横移（LATERAL 漏检时）仍能被兜底成 ACTIVE。
+    if (ml_stable == 1 && !targetMoving() && now - state_since > STATE_HOLD_MS) {
       changeState(HM_IDLE);
       return;
     }
@@ -560,7 +667,7 @@ void updateAnimation() {
   face_breath += (face_breath_target - face_breath) * 0.08f;
 
   // 独立的短眨眼：不再用长时间取模条件造成“闭眼卡住”。
-  if (state == HM_SLEEP) {
+  if (state == HM_SLEEP || ev_cur != EV_NONE) {
     blink_active = false;
     next_blink_at = now + 1200;
   } else if (!blink_active && (int32_t)(now - next_blink_at) >= 0) {
@@ -583,8 +690,13 @@ void drawEye(int cx, int cy, int open, bool sleepy) {
                EYE_WIDTH_PX, h, 1);
 }
 
-void drawMouth(int cx, bool smile) {
-  if (!smile) {
+void drawMouth(int cx, int mode) {
+  if (mode == 2) {
+    // 打哈欠的大 O 嘴。
+    oled.drawRBox(cx - 6, 44, 12, 11, 2);
+    return;
+  }
+  if (mode != 1) {
     // 平嘴：厚度保持和微笑嘴主体接近。
     oled.drawBox(cx - 14, 51, 28, 3);
     return;
@@ -652,7 +764,7 @@ void drawFace() {
       break;
   }
 
-  if (blink_active) {
+  if (blink_active && ev_cur == EV_NONE) {
     uint32_t elapsed = now - blink_started;
     float blink_scale;
     if (elapsed < 55) blink_scale = 1.0f - elapsed / 55.0f;
@@ -661,7 +773,19 @@ void drawFace() {
     eye_open = (int)(eye_open * constrain(blink_scale, 0.0f, 1.0f));
   }
 
+  // 一次性事件动画：帧内覆盖表情，播完回姿态层
   int eye_y = 23;
+  if (ev_cur == EV_YAWN) {
+    float p = constrain((now - ev_started) / (float)BEDTIME_YAWN_MS, 0.0f, 1.0f);
+    eye_open = p < 0.35f ? max(1, (int)(12 * (1 - p / 0.35f)))
+             : p < 0.6f  ? 1
+             : max(1, (int)(12 * (p - 0.6f) / 0.4f));
+  } else if (ev_cur == EV_RUB) {
+    eye_open = 2;
+    eye_y = 23 + ((now / 150) & 1 ? 1 : -1);   // 揉眼的上下蹭动
+  } else if (ev_cur == EV_DIM) {
+    eye_open = 1;
+  }
   drawEye(left_eye_x, eye_y, eye_open, sleepy);
   drawEye(right_eye_x, eye_y, eye_open, sleepy);
 
@@ -671,10 +795,27 @@ void drawFace() {
   else oled.drawBox(nose_x, 37, 8, 3);
 
   // 不是所有状态都笑：ACTIVE 使用参考图的微笑嘴，其余状态多数为平嘴。
-  drawMouth(mouth_x, state == HM_ACTIVE);
+  // 笑容有进入延迟（短暂误进 ACTIVE 不闪嘴）和最短保持时间（状态边界
+  // 来回抖时嘴型停留足够久才收）；睡眠/目送/醒来属于表情转折，不保留笑容。
+  if (state == HM_ACTIVE) {
+    if (smile_pending_since == 0) smile_pending_since = now;
+    mouth_mode = now - smile_pending_since >= SMILE_ENTER_MS ? 1 : 0;
+    if (mouth_mode == 1) smile_until = now + SMILE_MIN_MS;
+  } else {
+    smile_pending_since = 0;
+    // 保持期内的笑容继续显示；SLEEP/GOODBYE/WAKING 属表情转折，立即收起。
+    mouth_mode = (state == HM_IDLE || state == HM_APPROACH || state == HM_RETREAT) &&
+                 (int32_t)(now - smile_until) < 0 ? 1 : 0;
+  }
+  if (ev_cur == EV_YAWN) mouth_mode = 2;   // 打哈欠的大 O 嘴
+  drawMouth(mouth_x, mouth_mode);
 
-  // 睡眠呼吸：亮度保持很低，但不完全熄灭。
+  // 睡眠呼吸：亮度保持很低，但不完全熄灭；渐暗事件期间做斜坡。
   int contrast = state == HM_SLEEP ? 35 + (int)(face_breath * 20) : 170;
+  if (ev_cur == EV_DIM) {
+    float p = constrain((now - ev_started) / (float)BEDTIME_DIM_MS, 0.0f, 1.0f);
+    contrast = (int)(170 - p * (170 - 45));
+  }
   if (contrast != oled_contrast &&
       (now - last_contrast_update >= 100 || oled_contrast < 0)) {
     oled_contrast = contrast;
