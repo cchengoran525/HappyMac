@@ -1,0 +1,1123 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>HappyMac OLED 模拟器 — 128×64 等比例</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root { --bg:#0c0e11; --panel:#14171c; --line:#232830; --fg:#c9d1d9; --dim:#7d8590; --green:#7ee787; --amber:#e3b341; --red:#f85149; }
+  * { box-sizing: border-box; }
+  html, body { height:100%; }
+  body { margin:0; overflow:hidden; display:flex; flex-direction:column; background:var(--bg); color:var(--fg);
+         font: 13px/1.45 "PingFang SC","Microsoft YaHei",-apple-system,sans-serif; }
+  header { display:flex; align-items:baseline; gap:14px; padding:8px 16px 6px; white-space:nowrap;
+           border-bottom:1px solid var(--line); }
+  header h1 { font-size:15px; margin:0; }
+  header .sub { color:var(--dim); font-weight:400; font-size:12px; }
+  header .hdr-hint { color:var(--dim); font-size:11.5px; overflow:hidden; text-overflow:ellipsis; }
+
+  .grid { flex:1; min-height:0; display:grid; gap:10px; padding:10px 14px;
+          grid-template-columns: auto 272px minmax(280px,1fr);
+          grid-template-rows: minmax(0,1fr) clamp(180px, 26vh, 300px); }
+  .col-oled  { grid-column:1; grid-row:1; display:flex; flex-direction:column; gap:8px; min-height:0; }
+  .col-ctl   { grid-column:2; grid-row:1; min-height:0; }
+  .col-serial{ grid-column:3; grid-row:1; display:flex; flex-direction:column; min-height:0; }
+  .col-field { grid-column:1/4; grid-row:2; display:flex; flex-direction:column; min-height:0; }
+
+  .panel { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:10px 12px; }
+  .col-ctl .panel { height:100%; display:flex; flex-direction:column; justify-content:space-between; gap:8px; }
+
+  /* OLED：128×64 逻辑像素，整数倍放大（默认 ×4），pixelated 保持锐利 */
+  .bezel-row { display:flex; gap:12px; align-items:flex-start; }
+  .bezel { display:inline-block; background:#000; padding:10px; border-radius:10px;
+           border:1px solid #2a2f37; box-shadow: inset 0 0 20px #000, 0 3px 14px rgba(0,0,0,.5); }
+  #oled { width:640px; height:320px; image-rendering: pixelated; display:block; background:#0a0a0a; }
+  .side { display:flex; gap:8px; align-items:center; margin-top:8px; }
+  #oledMini { width:29.4mm; height:14.7mm; image-rendering: pixelated; background:#0a0a0a;
+              border:2px solid #2a2f37; border-radius:3px; flex:none; }
+  .mini-hint { color:var(--dim); font-size:10.5px; line-height:1.5; white-space:nowrap; }
+
+  .readouts { flex:1; display:grid; grid-template-columns:repeat(3,1fr); grid-auto-rows:1fr; gap:6px; }
+  .ro { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:6px 9px;
+        display:flex; flex-direction:column; justify-content:center; gap:2px; }
+  .ro .k { color:var(--dim); font-size:10px; white-space:nowrap; }
+  .ro .v { font-size:13px; font-weight:600; font-variant-numeric: tabular-nums; white-space:nowrap; }
+  .ro.active .v { color:var(--green); }
+  .bar { height:4px; background:#22272e; border-radius:2px; margin-top:4px; overflow:hidden; }
+  .bar i { display:block; height:100%; background:var(--green); width:0%; }
+
+  h2 { font-size:12px; margin:0 0 6px; color:var(--dim); font-weight:600; letter-spacing:.04em; }
+  .btns { display:flex; flex-wrap:wrap; gap:5px; }
+  button { background:#1b2028; color:var(--fg); border:1px solid var(--line); border-radius:6px;
+           padding:4px 9px; font-size:12px; cursor:pointer; }
+  button:hover { border-color:#3d444d; }
+  button.on { background:#12351c; border-color:#2ea043; color:var(--green); }
+  button:disabled { opacity:.4; cursor:default; }
+  .row { display:flex; align-items:center; gap:7px; margin-top:7px; flex-wrap:wrap; }
+  label.sw { display:flex; align-items:center; gap:5px; font-size:12px; cursor:pointer; white-space:nowrap; }
+  select, input[type=file] { background:#1b2028; color:var(--fg); border:1px solid var(--line);
+           border-radius:6px; padding:4px 6px; font-size:12px; max-width:100%; }
+  .hint { color:var(--dim); font-size:11px; margin-top:5px; }
+  details { color:var(--dim); font-size:11.5px; margin-top:8px; }
+  details summary { cursor:pointer; color:var(--fg); font-size:12px; }
+  details li { margin-bottom:3px; }
+
+  #field { flex:1; width:100%; min-height:0; touch-action:none; cursor:crosshair; border-radius:8px; display:block; }
+  .legend-inline { color:var(--dim); font-size:10.5px; font-weight:400; margin-left:8px; }
+  #serial { flex:1; min-height:0; overflow-y:auto; background:#0a0c0f; border:1px solid var(--line); border-radius:8px;
+            padding:6px 8px; font:10.5px/1.5 "SF Mono",Menlo,Consolas,monospace;
+            color:#9aa4af; white-space:pre; }
+  #serial .st { color:var(--green); } #serial .ml { color:#79c0ff; } #serial .ev { color:var(--amber); }
+
+  .stateline { display:flex; gap:4px; }
+  .stateline b { flex:1; text-align:center; font-size:10.5px; padding:3px 0; border-radius:5px;
+                 background:#1b2028; color:#555c66; font-weight:600; }
+  .stateline b.cur { background:#12351c; color:var(--green); }
+</style>
+</head>
+<body>
+<header>
+  <h1>HappyMac OLED 模拟器 <span class="sub">happymac_v0 固件逻辑 1:1 移植</span></h1>
+  <span class="hdr-hint">状态机 / 运动证据积分 / Y 趋势武装 / TinyML 决策树 / 动画层全部与 firmware/happymac_v0 同源 · 单屏使用，无需滚动</span>
+</header>
+
+<div class="grid">
+  <div class="col-oled">
+    <div class="bezel-row">
+      <div class="bezel"><canvas id="oled" width="128" height="64"></canvas></div>
+      <div class="side">
+        <canvas id="oledMini" width="128" height="64"></canvas>
+        <div class="mini-hint">1.3″ 实际大小<br>≈ 29.4×14.7 mm</div>
+      </div>
+    </div>
+    <div class="stateline" id="stateline"></div>
+    <div class="readouts">
+      <div class="ro" id="roState"><div class="k">状态机</div><div class="v">—</div></div>
+      <div class="ro" id="roML"><div class="k">TinyML</div><div class="v">—</div></div>
+      <div class="ro" id="roPos"><div class="k">位置</div><div class="v">—</div></div>
+      <div class="ro" id="roScore"><div class="k">运动证据分</div><div class="v">0 / 8</div><div class="bar"><i></i></div></div>
+      <div class="ro" id="roTrend"><div class="k">Y 趋势 (mm/140ms)</div><div class="v">0.0</div><div class="bar"><i style="background:var(--amber)"></i></div></div>
+      <div class="ro" id="roXY"><div class="k">滤波 X / Y (mm)</div><div class="v">—</div></div>
+    </div>
+  </div>
+
+  <aside class="col-ctl">
+    <div class="panel">
+      <div class="grp">
+        <h2>输入源</h2>
+        <div class="btns" id="modeBtns">
+          <button data-mode="manual" class="on">手动拖拽</button>
+          <button data-mode="script">场景剧本</button>
+          <button data-mode="csv">CSV 回放</button>
+        </div>
+        <div class="row" id="scriptRow" style="display:none">
+          <div class="btns" id="scriptBtns">
+            <button data-s="sit">静坐工作</button>
+            <button data-s="hello">凑近打招呼</button>
+            <button data-s="peek">左右探头</button>
+            <button data-s="leave">离开→回来</button>
+            <button data-s="night">深夜静止</button>
+            <button data-s="stress">贴脸强噪声</button>
+          </div>
+        </div>
+        <div class="row" id="csvRow" style="display:none">
+          <input type="file" id="csvFile" accept=".csv">
+          <select id="csvSpeed">
+            <option value="1">×1 实时</option>
+            <option value="4">×4</option>
+            <option value="10">×10</option>
+          </select>
+        </div>
+        <div class="hint" id="modeHint">在下方俯视图里拖拽小人 = 人在雷达前移动；松手即静止。</div>
+      </div>
+
+      <div class="grp">
+        <h2>显示与开关</h2>
+        <div class="row">
+          <div class="btns" id="scaleBtns">
+            <button data-s="3">×3</button>
+            <button data-s="4">×4</button>
+            <button data-s="5" class="on">×5</button>
+          </div>
+          <label class="sw"><input type="checkbox" id="swNoise" checked> 雷达噪声</label>
+        </div>
+        <div class="row">
+          <label class="sw"><input type="checkbox" id="swLegacy"> 旧版单帧判定</label>
+          <label class="sw"><input type="checkbox" id="swDebug" checked> OLED 调试层</label>
+        </div>
+        <div class="row">
+          <button id="btnCal">重校准 (!CAL)</button>
+          <button id="btnPause">暂停</button>
+          <button id="btnReset">重置</button>
+          <select id="speed">
+            <option value="0.5">×0.5</option>
+            <option value="1" selected>×1</option>
+            <option value="2">×2</option>
+            <option value="4">×4</option>
+          </select>
+        </div>
+        <div class="hint">「旧版单帧判定」复现修复前的笑容横跳；关掉即当前固件行为。</div>
+      </div>
+
+      <details>
+        <summary>使用说明 / 能干什么</summary>
+        <ul style="padding-left:16px;margin:6px 0 0">
+          <li>调参：改本文件 <code>FW</code> 常量区（与固件 <code>#define</code> 一一对应）。</li>
+          <li>验证防抖：勾/去「旧版单帧判定」对比噪声下表现。</li>
+          <li>回放真实数据：选 <code>training/sessions/*.csv</code>。</li>
+          <li>剧本模式快速过一遍全部状态；串口面板与真机日志同格式，方便日后对拍。</li>
+        </ul>
+      </details>
+    </div>
+  </aside>
+
+  <div class="panel col-serial">
+    <h2>串口日志（与真机同格式）</h2>
+    <div id="serial"></div>
+  </div>
+
+  <div class="panel col-field">
+    <h2>雷达俯视图（拖拽小人）<span class="legend-inline">底部中心 = LD2450 · 横轴左右 X ±2.2 m · 纵轴距离 Y 0.2–3.0 m · 绿点轨迹 = 最近 5 秒</span></h2>
+    <canvas id="field"></canvas>
+  </div>
+</div>
+
+<script>
+"use strict";
+/* ============================================================
+ * HappyMac v0 固件逻辑 1:1 移植（与 firmware/happymac_v0/happymac_v0.ino 同源）
+ * createSimCore() 为纯逻辑、无 DOM：可在 Node 里直接做无头测试。
+ * ============================================================ */
+const FW = { /* 与固件 #define 一一对应 */
+  EMA_A: 0.55,
+  DISPLAY_MS: 80,
+  ABSENT_MS: 8000,
+  GOODBYE_MS: 1800,
+  WAKING_MS: 1800,
+  STATE_HOLD_MS: 450,
+  ML_WINDOW_MS: 2000,
+  ML_MIN_SAMPLES: 20,
+  ML_RING_CAP: 64,
+  ML_CONFIRM_MS: 2000,
+  PRESENCE_DEBOUNCE_MS: 500,
+  POSITION_ENTER_PX: 170.0,
+  POSITION_EXIT_PX: 80.0,
+  LOOK_MAX_PX: 30.0,
+  LOOK_NORMAL_PX: 24.0,
+  LOOK_NORMAL_INPUT: 700.0,
+  LOOK_EXTREME_INPUT: 1400.0,
+  BLINK_DURATION_MS: 180,
+  EYE_WIDTH_PX: 8,
+  EYE_MAX_HEIGHT_PX: 14,
+  LOOK_DEADZONE_MM: 80.0,
+  LOOK_TARGET_ALPHA: 0.08,
+  LOOK_MOVE_ALPHA: 0.06,
+  LOOK_MAX_STEP_PX: 0.55,
+  ATTENTION_DRIFT_PX: 1.5,
+  Y_TREND_SAMPLE_MS: 140,
+  Y_TREND_ALPHA: 0.28,
+  Y_TREND_TRIGGER_MM: 15.0,
+  Y_TREND_RELEASE_MM: 6.0,
+  TRANSIENT_HOLD_MS: 900,
+  TRANSIENT_COOLDOWN_MS: 400,
+  MOTION_SPEED_TH: 15.0,
+  MOTION_REF_MS: 700,
+  MOTION_DELTA_MM: 130.0,
+  MOTION_SCORE_MAX: 8,
+  MOTION_ENTER_SCORE: 4,
+  MOTION_EXIT_SCORE: 1,
+  V_NOISE_FLOOR: 8.0,      // v 特征噪声底：拆掉微动误入 LATERAL 的路
+  SMILE_ENTER_MS: 600,      // ACTIVE 持续这么久才上笑容：短暂误进不闪嘴
+  SMILE_MIN_MS: 1500,       // 笑容最短保持时间，防止嘴型反复横跳
+  // ── 睡前过渡链（一次性事件动画：打哈欠→揉眼→渐暗→入睡，随时可被打断）──
+  BEDTIME_YAWN_AT: 2500,    // 无人 2.5s 后开始链（在 GOODBYE 目送之后）
+  BEDTIME_YAWN_MS: 2000,
+  BEDTIME_RUB_MS:  1500,
+  BEDTIME_DIM_MS:  1200,    // 渐暗结束转 SLEEP（合计 last_seen+7.2s，早于 8s 兜底）
+  // 注："突然转头看过来"的识别走 TinyML 路线（训练新类别 → 专属动画），
+  // 不做规则通道；数据上转头在 2450 x/y/v 里几乎不可分（见 2026-08-29 评测）。
+};
+
+const STATE_NAMES = ["SLEEP","GOODBYE","WAKING","IDLE","ACTIVE","APPROACH","RETREAT"];
+const ML_NAMES = ["ABSENT","STILL","LATERAL","APPROACH","RETREAT"];
+const EV_NAMES = ["-","YAWN","RUB","DIM"];
+const POS_NAMES = ["CENTER","LEFT","RIGHT"];
+
+/* tinyml_v0_tree_d4.h — sklearn DecisionTreeClassifier(max_depth=4) 原样移植 */
+function tinymlV0Predict(f) {
+  const abs_slope_x = f[0], slope_y = f[1], mean_es = f[4],
+        std_es = f[5], mean_abs_v = f[6], max_abs_v = f[7];
+  if (mean_es <= 9.50) {
+    if (mean_es <= 7.44444442) return 0;
+    if (std_es <= 1.33473241) return abs_slope_x <= 11.11721635 ? 1 : 3;
+    return slope_y <= 18.86263752 ? 0 : 3;
+  }
+  if (mean_abs_v <= 2.51851857) {
+    if (mean_es <= 54.12962914) return slope_y <= 0.94871792 ? 1 : 4;
+    return abs_slope_x <= 3.08638585 ? 1 : 2;
+  }
+  if (max_abs_v <= 35.50) return 2;
+  return slope_y <= -2.62210011 ? 3 : 4;
+}
+
+function createSimCore() {
+  // ── 时间 ──
+  let t = 0;                      // 模拟毫秒（对应 millis()）
+  let legacyMode = false;         // 旧版单帧判定开关（演示修复前后差异）
+
+  // ── LD2450 原始帧流状态（对应 parse2450）──
+  const r50 = { x:0, y:0, v:0, ok:false, last:0, seq:0 };
+  let flt = { x:0, y:0, v:0 }, prev_y = 0, filter_ok = false, center_x = 0, center_ok = false;
+
+  // ── 运动证据积分（对应 updateMotionEvidence）──
+  let motion_ref_x = 0, motion_ref_y = 0, motion_ref_at = 0;
+  let motion_score = 0, motion_stable = false;
+
+  // ── LD2410 / SR602 ──
+  let r10_em = 0, r10_es = 0, r10_pres = false, ir_present = false;
+
+  // ── 存在性防抖 ──
+  let stable_presence = false, presence_candidate_since = 0;
+
+  // ── Y 趋势 ──
+  let y_trend_sample = 0, y_step_filtered = 0, y_trend_sample_at = 0, y_trend_ready = false, y_trend_armed = true;
+
+  // ── TinyML 环形缓冲 ──
+  const ML_RING_CAP = FW.ML_RING_CAP;
+  const ml_ring = Array.from({length: ML_RING_CAP}, () => ({t:0,x:0,y:0,v:0,es:0}));
+  let ml_head = 0, ml_count = 0, ml_seq_seen = 0;
+  let ml_candidate = 255, ml_stable = 255, ml_candidate_since = 0;
+
+  // ── 状态机 ──
+  const HM = { SLEEP:0, GOODBYE:1, WAKING:2, IDLE:3, ACTIVE:4, APPROACH:5, RETREAT:6 };
+  let state = HM.SLEEP, previous_state = HM.SLEEP, state_since = 0;
+  let had_target = false, last_seen = 0;
+  let transient_until = 0, transient_cooldown_until = 0;
+  let y_delta = 0;
+
+  // ── 动画 ──
+  let face_look = 0, face_look_target = 0, face_breath = 0, face_breath_target = 0;
+  let model_a_position = 0, model_a_previous = 0, model_a_direction = 0;
+  let attention_offset = 0, attention_target = 0, attention_until = 0, next_attention_at = 7000, attention_sequence = 0;
+  let nose_direction = -1;
+  let blink_active = false, blink_started = 0, next_blink_at = 5200, blink_sequence = 0;
+  let smile_until = 0;
+  let eye_open = 12, sleepy = false, smiling = false, contrast = 170;
+  let smile_pending_since = 0;
+  let mouth_mode = "flat";
+  let eye_wiggle = 0;
+  const EV = { NONE:0, YAWN:1, RUB:2, DIM:3 };
+  let ev_cur = 0, ev_started = 0;
+
+  // 事件回调（模拟器串口面板用；固件里对应 Serial.printf）
+  let onLog = null;
+  const log = (tag, msg) => { if (onLog) onLog(tag, msg); };
+  function changeState(next) {
+    if (next === state) return;
+    previous_state = state; state = next; state_since = t;
+    log("st", `STATE,${Math.round(t)},${STATE_NAMES[state]}`);
+  }
+
+  // ── LD2450 帧 → 滤镜 → 运动证据（parse2450 的有效目标分支）──
+  function ingest2450(x, y, v) {
+    r50.x = x; r50.y = y; r50.v = v; r50.ok = true; r50.last = t; r50.seq++;
+    if (!filter_ok) {
+      flt.x = x; flt.y = y; prev_y = y; flt.v = v; filter_ok = true;
+    } else {
+      prev_y = flt.y;
+      flt.x = FW.EMA_A * x + (1 - FW.EMA_A) * flt.x;
+      flt.y = FW.EMA_A * y + (1 - FW.EMA_A) * flt.y;
+      flt.v = 0.35 * v + 0.65 * flt.v;
+    }
+    if (!center_ok) { center_x = flt.x; center_ok = true; }
+    updateMotionEvidence();
+  }
+
+  // 全零目标帧：固件解析到三个目标全为 0 时会立即置 r50_ok=false
+  function ingest2450Empty() { r50.ok = false; r50.last = t; r50.seq++; }
+
+  function updateMotionEvidence() {
+    if (motion_ref_at === 0) {
+      motion_ref_x = flt.x; motion_ref_y = flt.y; motion_ref_at = t; return;
+    }
+    const evidence = Math.abs(flt.v) > FW.MOTION_SPEED_TH ||
+                     Math.abs(flt.x - motion_ref_x) > FW.MOTION_DELTA_MM ||
+                     Math.abs(flt.y - motion_ref_y) > FW.MOTION_DELTA_MM;
+    motion_score += evidence ? 1 : -1;
+    motion_score = Math.max(0, Math.min(FW.MOTION_SCORE_MAX, motion_score));
+    if (!motion_stable && motion_score >= FW.MOTION_ENTER_SCORE) motion_stable = true;
+    else if (motion_stable && motion_score <= FW.MOTION_EXIT_SCORE) motion_stable = false;
+    if (t - motion_ref_at >= FW.MOTION_REF_MS) {
+      motion_ref_x = flt.x; motion_ref_y = flt.y; motion_ref_at = t;
+    }
+  }
+
+  // ── 传感器层输入（由模拟器雷达模型/CSV 提供）──
+  function set2410(pres, em, es) { r10_pres = pres; r10_em = em; r10_es = es; }
+  function setIR(v) { ir_present = v; }
+
+  function sensorTick() { // 对应 readSensors() 的 2450 失联/衰减部分
+    if (r50.ok && t - r50.last > 500) r50.ok = false;
+    if (!r50.ok && motion_score > 0) {
+      motion_score--;
+      if (motion_stable && motion_score <= FW.MOTION_EXIT_SCORE) motion_stable = false;
+    }
+  }
+
+  function targetPresent() { return r50.ok || r10_pres || ir_present; }
+
+  function stableTargetPresent() {
+    const raw = targetPresent();
+    if (raw === stable_presence) { presence_candidate_since = 0; return stable_presence; }
+    if (presence_candidate_since === 0) presence_candidate_since = t;
+    if (t - presence_candidate_since >= FW.PRESENCE_DEBOUNCE_MS) {
+      stable_presence = raw; presence_candidate_since = 0;
+    }
+    return stable_presence;
+  }
+
+  function targetMoving() {
+    if (!r50.ok) return false;
+    if (legacyMode) { // 修复前的单帧硬阈值，仅用于对比演示
+      return Math.abs(r50.v) > 10 || Math.abs(r50.x - flt.x) > 80 || Math.abs(r50.y - flt.y) > 60;
+    }
+    return motion_stable;
+  }
+
+  function updateYTrend() {
+    if (!r50.ok) { y_trend_ready = false; y_step_filtered = 0; return; }
+    if (!y_trend_ready) { y_trend_sample = flt.y; y_trend_sample_at = t; y_trend_ready = true; return; }
+    if (t - y_trend_sample_at < FW.Y_TREND_SAMPLE_MS) return;
+    const step = flt.y - y_trend_sample;
+    y_step_filtered += (step - y_step_filtered) * FW.Y_TREND_ALPHA;
+    y_trend_sample = flt.y; y_trend_sample_at = t;
+  }
+
+  // ── Model A：左右位置（规则版）──
+  function updateModelA() {
+    if (!r50.ok || state === HM.SLEEP || !center_ok) {
+      model_a_position = 0; model_a_direction *= 0.90; return;
+    }
+    const delta = flt.x - center_x;
+    if (model_a_position === 1) { if (delta > -FW.POSITION_EXIT_PX) model_a_position = 0; }
+    else if (model_a_position === 2) { if (delta < FW.POSITION_EXIT_PX) model_a_position = 0; }
+    else {
+      if (delta < -FW.POSITION_ENTER_PX) model_a_position = 1;
+      else if (delta > FW.POSITION_ENTER_PX) model_a_position = 2;
+    }
+    const magnitude = Math.abs(delta);
+    const normal_part = Math.min(Math.max(magnitude / FW.LOOK_NORMAL_INPUT, 0), 1);
+    const extreme_part = Math.min(Math.max((magnitude - FW.LOOK_NORMAL_INPUT) /
+      (FW.LOOK_EXTREME_INPUT - FW.LOOK_NORMAL_INPUT), 0), 1);
+    const look_magnitude = normal_part * FW.LOOK_NORMAL_PX + extreme_part * (FW.LOOK_MAX_PX - FW.LOOK_NORMAL_PX);
+    model_a_direction = (delta < 0 ? 1 : -1) * look_magnitude;
+    if (magnitude < FW.LOOK_DEADZONE_MM) model_a_direction = 0;
+    else if (model_a_position === 0 && magnitude < FW.POSITION_EXIT_PX)
+      model_a_direction *= magnitude / FW.POSITION_EXIT_PX;
+    if (model_a_position !== model_a_previous) {
+      model_a_previous = model_a_position;
+      log("ev", `POS,${Math.round(t)},${POS_NAMES[model_a_position]},delta=${delta.toFixed(0)},look=${model_a_direction.toFixed(1)}`);
+    }
+  }
+
+  // ── TinyML ──
+  function mlPushSample() {
+    const s = ml_ring[ml_head];
+    s.t = r50.last; s.x = r50.x; s.y = r50.y; s.v = r50.v;
+    s.es = Math.min(Math.max(r10_es, 0), 65535);
+    ml_head = (ml_head + 1) % ML_RING_CAP;
+    if (ml_count < ML_RING_CAP) ml_count++;
+  }
+
+  function updateTinyML() {
+    if (!r50.ok) { ml_candidate = 255; ml_stable = 255; return; }
+    if (r50.seq === ml_seq_seen) return;
+    ml_seq_seen = r50.seq;
+    mlPushSample();
+    let first = 0;
+    while (first < ml_count) {
+      const idx = (ml_head + ML_RING_CAP - ml_count + first) % ML_RING_CAP;
+      if (t - ml_ring[idx].t <= FW.ML_WINDOW_MS) break;
+      first++;
+    }
+    const n = ml_count - first;
+    if (n < FW.ML_MIN_SAMPLES) return;
+    let sum_k=0,sum_k2=0,sum_x=0,sum_y=0,sum_es=0,sum_es2=0,sum_abs_v=0,max_abs_v=0,es_edge=0,prev_es=-1;
+    for (let j=0;j<n;j++) {
+      const idx = (ml_head + ML_RING_CAP - ml_count + first + j) % ML_RING_CAP;
+      const s = ml_ring[idx];
+      // v 噪声底：静态/微动时雷达 v 在 ±8 内抖（含 8 的倍数毛刺）。减掉噪声底后，
+      // typing/head 微动不再把 mean_abs_v 顶过树的 LATERAL 门限；
+      // 真实横移仍由 slope/std_X 位移特征驱动，快动作远高于噪声底不受影响。
+      const afv = Math.max(0, Math.abs(s.v) - FW.V_NOISE_FLOOR);
+      sum_k += j; sum_k2 += j*j; sum_x += s.x; sum_y += s.y;
+      sum_es += s.es; sum_es2 += s.es*s.es; sum_abs_v += afv;
+      if (afv > max_abs_v) max_abs_v = afv;
+      if (prev_es === 0 && s.es > 0) es_edge++;
+      prev_es = s.es;
+    }
+    const denom = n*sum_k2 - sum_k*sum_k;
+    if (denom <= 0) return;
+    let sum_kx=0,sum_ky=0;
+    for (let j=0;j<n;j++) {
+      const idx = (ml_head + ML_RING_CAP - ml_count + first + j) % ML_RING_CAP;
+      sum_kx += j*ml_ring[idx].x; sum_ky += j*ml_ring[idx].y;
+    }
+    const slope_x = (n*sum_kx - sum_k*sum_x)/denom;
+    const slope_y = (n*sum_ky - sum_k*sum_y)/denom;
+    const mean_es = sum_es/n;
+    const var_es = Math.max(0, sum_es2/n - mean_es*mean_es);
+    let var_x=0, var_y=0;
+    const mean_x = sum_x/n, mean_y = sum_y/n;
+    for (let j=0;j<n;j++) {
+      const idx = (ml_head + ML_RING_CAP - ml_count + first + j) % ML_RING_CAP;
+      var_x += (ml_ring[idx].x-mean_x)**2; var_y += (ml_ring[idx].y-mean_y)**2;
+    }
+    const features = [Math.abs(slope_x), slope_y, Math.sqrt(var_x/n), Math.sqrt(var_y/n),
+                      mean_es, Math.sqrt(var_es), sum_abs_v/n, max_abs_v, es_edge];
+    const predicted = tinymlV0Predict(features);
+    if (predicted !== ml_candidate) {
+      ml_candidate = predicted; ml_candidate_since = t;
+    } else if (ml_stable !== ml_candidate && t - ml_candidate_since >= FW.ML_CONFIRM_MS) {
+      ml_stable = ml_candidate;
+      log("ml", `ML,${Math.round(t)},${tinymlV0LabelName(ml_stable)},meanEs=${features[4].toFixed(1)},slopeY=${features[1].toFixed(1)}`);
+    }
+  }
+  function tinymlV0LabelName(l) { return ML_NAMES[l] || "UNKNOWN"; }
+
+  // ── 状态机 ──
+  function updateState() {
+    updateYTrend();
+    const present = stableTargetPresent();
+    if (present) {
+      ev_cur = EV.NONE;   // 人回来了：睡前链等一次性事件立刻打断
+      last_seen = t;
+      if (!had_target || state === HM.SLEEP || state === HM.GOODBYE) {
+        had_target = true; changeState(HM.WAKING);
+      }
+    } else if (had_target && t - last_seen < FW.ABSENT_MS) {
+      if (state !== HM.GOODBYE && state !== HM.SLEEP) changeState(HM.GOODBYE);
+      // 睡前过渡链：打哈欠→揉眼→渐暗→入睡；期间有人回来随时打断
+      const since = t - last_seen;
+      const tR = FW.BEDTIME_YAWN_AT + FW.BEDTIME_YAWN_MS,
+            tD = tR + FW.BEDTIME_RUB_MS, tEnd = tD + FW.BEDTIME_DIM_MS;
+      if (since >= FW.BEDTIME_YAWN_AT) {
+        const want = since < tR ? EV.YAWN : since < tD ? EV.RUB : EV.DIM;
+        if (ev_cur !== want) {
+          ev_cur = want; ev_started = t;
+          log("ev", `EV,${Math.round(t)},${EV_NAMES[ev_cur]}`);
+        }
+        if (since >= tEnd) { had_target = false; ev_cur = EV.NONE; changeState(HM.SLEEP); }
+      }
+    } else if (had_target && t - last_seen >= FW.ABSENT_MS) {
+      had_target = false; ev_cur = EV.NONE; changeState(HM.SLEEP);
+    }
+    if (!present) return;
+    if (state === HM.WAKING && t - state_since < FW.WAKING_MS) return;
+    if ((state === HM.APPROACH || state === HM.RETREAT) && t < transient_until) return;
+
+    // Y 趋势事件（带武装滞回）
+    y_delta = y_step_filtered;
+    if (!y_trend_armed && Math.abs(y_step_filtered) < FW.Y_TREND_RELEASE_MM) y_trend_armed = true;
+    if (r50.ok && y_trend_armed && t >= transient_cooldown_until && y_step_filtered < -FW.Y_TREND_TRIGGER_MM) {
+      changeState(HM.APPROACH); y_trend_armed = false;
+      transient_until = t + FW.TRANSIENT_HOLD_MS;
+      transient_cooldown_until = transient_until + FW.TRANSIENT_COOLDOWN_MS;
+      return;
+    }
+    if (r50.ok && y_trend_armed && t >= transient_cooldown_until && y_step_filtered > FW.Y_TREND_TRIGGER_MM) {
+      changeState(HM.RETREAT); y_trend_armed = false;
+      transient_until = t + FW.TRANSIENT_HOLD_MS;
+      transient_cooldown_until = transient_until + FW.TRANSIENT_COOLDOWN_MS;
+      return;
+    }
+
+    if (ml_stable <= 4) {
+      if (ml_stable === 2) { changeState(HM.ACTIVE); return; }
+      // ML 判 STILL 时若规则运动积分器正在报警，放行给规则路径：
+      // 慢速大幅横移（LATERAL 漏检时）仍能被兜底成 ACTIVE。
+      if (ml_stable === 1 && !targetMoving() && t - state_since > FW.STATE_HOLD_MS) { changeState(HM.IDLE); return; }
+    }
+    if (targetMoving()) changeState(HM.ACTIVE);
+    else if (t - state_since > FW.STATE_HOLD_MS) changeState(HM.IDLE);
+  }
+
+  // ── 动画层 ──
+  function updateAnimation() {
+    updateModelA();
+    if (model_a_position === 1) nose_direction = -1;
+    else if (model_a_position === 2) nose_direction = 1;
+    if (center_ok && !targetMoving() && state === HM.IDLE)
+      center_x = center_x * 0.995 + flt.x * 0.005;
+
+    const phase = (t % 2600) / 2600 * Math.PI * 2;
+    face_breath_target = (Math.sin(phase) + 1) * 0.5;
+
+    const calm = state === HM.IDLE && r50.ok && !targetMoving() && Math.abs(model_a_direction) < 3;
+    if (calm) {
+      if (attention_target === 0 && t - next_attention_at >= 0) {
+        attention_target = (attention_sequence++ & 1) ? FW.ATTENTION_DRIFT_PX : -FW.ATTENTION_DRIFT_PX;
+        attention_until = t + 900;
+      } else if (attention_target !== 0 && t >= attention_until) {
+        attention_target = 0;
+        next_attention_at = t + 3600 + (attention_sequence % 5) * 500;
+      }
+    } else { attention_target = 0; next_attention_at = t + 2200; }
+    attention_offset += (attention_target - attention_offset) * 0.05;
+
+    let desired_look = Math.min(Math.max(model_a_direction + attention_offset, -FW.LOOK_MAX_PX), FW.LOOK_MAX_PX);
+    if (state === HM.SLEEP) desired_look = 0;
+    face_look_target += (desired_look - face_look_target) * FW.LOOK_TARGET_ALPHA;
+    const look_step = (face_look_target - face_look) * FW.LOOK_MOVE_ALPHA;
+    face_look += Math.min(Math.max(look_step, -FW.LOOK_MAX_STEP_PX), FW.LOOK_MAX_STEP_PX);
+    face_breath += (face_breath_target - face_breath) * 0.08;
+
+    if (state === HM.SLEEP || ev_cur !== EV.NONE) { blink_active = false; next_blink_at = t + 1200; }
+    else if (!blink_active && t - next_blink_at >= 0) { blink_active = true; blink_started = t; }
+    else if (blink_active && t - blink_started >= FW.BLINK_DURATION_MS) {
+      blink_active = false;
+      next_blink_at = t + 3800 + (blink_sequence++ % 5) * 550;
+    }
+
+    // 表情参数（drawFace 用）
+    eye_open = 12; sleepy = false;
+    switch (state) {
+      case HM.SLEEP: sleepy = true; eye_open = 1; break;
+      case HM.GOODBYE: eye_open = 9; break;
+      case HM.WAKING: eye_open = Math.trunc(3 + Math.min(Math.max((t - state_since)/FW.WAKING_MS,0),1) * 10); break;
+      case HM.ACTIVE: eye_open = 13; break;
+      case HM.APPROACH: eye_open = 14; break;
+      case HM.RETREAT: eye_open = 7; break;
+      case HM.IDLE: eye_open = 11; break;
+    }
+    const ev_active = ev_cur !== EV.NONE;
+    if (blink_active && !ev_active) {
+      const el = t - blink_started;
+      let bs;
+      if (el < 55) bs = 1 - el/55;
+      else if (el < 105) bs = 0;
+      else bs = (el - 105) / 75;
+      eye_open = Math.trunc(eye_open * Math.min(Math.max(bs,0),1));
+    }
+
+    if (state === HM.ACTIVE) {
+      // 笑容有进入延迟：ACTIVE 持续足够久嘴才笑，短暂误进不闪嘴
+      if (smile_pending_since === 0) smile_pending_since = t;
+      mouth_mode = (t - smile_pending_since >= FW.SMILE_ENTER_MS) ? "smile" : "flat";
+      if (mouth_mode === "smile") smile_until = t + FW.SMILE_MIN_MS;
+    } else {
+      smile_pending_since = 0;
+      mouth_mode = ((state === HM.IDLE || state === HM.APPROACH || state === HM.RETREAT) &&
+                    t < smile_until) ? "smile" : "flat";
+    }
+    smiling = mouth_mode === "smile";
+    // 一次性事件动画：帧内覆盖表情，播完回姿态层
+    eye_wiggle = 0;
+    if (ev_cur === EV.YAWN) {
+      const p = Math.min((t - ev_started) / FW.BEDTIME_YAWN_MS, 1);
+      eye_open = p < 0.35 ? Math.max(1, Math.round(12 * (1 - p / 0.35)))
+               : p < 0.6 ? 1
+               : Math.max(1, Math.round(12 * (p - 0.6) / 0.4));
+      mouth_mode = "yawn";
+    } else if (ev_cur === EV.RUB) {
+      eye_open = 2;
+      eye_wiggle = ((t / 150) & 1) ? 1 : -1;
+      mouth_mode = "flat";
+    } else if (ev_cur === EV.DIM) {
+      eye_open = 1;
+      mouth_mode = "flat";
+    }
+    contrast = state === HM.SLEEP ? 35 + face_breath * 20 : 170;
+    if (ev_cur === EV.DIM) {
+      const p = Math.min((t - ev_started) / FW.BEDTIME_DIM_MS, 1);
+      contrast = Math.round(170 - p * (170 - 45));
+    }
+  }
+
+  // ── 主循环节拍（对应 loop()，固定 10ms 步长）──
+  function step(dtMs) {
+    const steps = Math.max(1, Math.round(dtMs / 10));
+    for (let i = 0; i < steps; i++) {
+      t += 10;
+      sensorTick();
+      updateTinyML();
+      updateState();
+      updateAnimation();
+    }
+  }
+
+  function reset() {
+    t = 0;
+    r50.ok = false; r50.seq = 0; r50.last = 0;
+    flt = {x:0,y:0,v:0}; filter_ok = false; center_ok = false;
+    motion_ref_at = 0; motion_score = 0; motion_stable = false;
+    stable_presence = false; presence_candidate_since = 0;
+    y_trend_ready = false; y_step_filtered = 0; y_trend_armed = true;
+    ml_head = 0; ml_count = 0; ml_seq_seen = 0; ml_candidate = 255; ml_stable = 255;
+    state = HM.SLEEP; previous_state = HM.SLEEP; state_since = 0;
+    had_target = false; last_seen = 0;
+    transient_until = 0; transient_cooldown_until = 0;
+    face_look = 0; face_look_target = 0; smile_until = 0; smiling = false;
+    smile_pending_since = 0; mouth_mode = "flat"; eye_wiggle = 0;
+    ev_cur = 0; ev_started = 0;
+    blink_active = false; next_blink_at = 5200; blink_sequence = 0;
+    attention_offset = 0; attention_target = 0; next_attention_at = 7000;
+  }
+
+  function calibrate() { filter_ok = false; center_ok = false; }
+
+  return {
+    step, reset, calibrate, ingest2450, ingest2450Empty, set2410, setIR,
+    get t(){return t}, get state(){return state}, get mlStable(){return ml_stable},
+    get mlCandidate(){return ml_candidate}, get position(){return model_a_position},
+    get motionScore(){return motion_score}, get motionStable(){return motion_stable},
+    get yTrend(){return y_step_filtered}, get flt(){return flt}, get r50(){return r50},
+    get faceLook(){return face_look}, get smiling(){return smiling},
+    get mouthMode(){return mouth_mode}, get eyeWiggle(){return eye_wiggle},
+    get ev(){return ev_cur}, get evName(){return EV_NAMES[ev_cur]},
+    get eyeOpen(){return eye_open}, get sleepy(){return sleepy}, get contrast(){return contrast},
+    get noseDirection(){return nose_direction},
+    set legacy(v){ legacyMode = v; }, get legacy(){ return legacyMode; },
+    set onLog(fn){ onLog = fn; },
+    HM, STATE_NAMES, ML_NAMES, POS_NAMES,
+  };
+}
+
+/* ============================================================
+ * 渲染：128×64 帧缓冲 + u8g2 风格绘图原语 + 5×7 点阵字体
+ * ============================================================ */
+const FONT5x7 = {
+  A:[0x7E,0x11,0x11,0x11,0x7E], B:[0x7F,0x49,0x49,0x49,0x36], C:[0x3E,0x41,0x41,0x41,0x22],
+  D:[0x7F,0x41,0x41,0x22,0x1C], E:[0x7F,0x49,0x49,0x49,0x41], F:[0x7F,0x09,0x09,0x09,0x01],
+  G:[0x3E,0x41,0x49,0x49,0x7A], H:[0x7F,0x08,0x08,0x08,0x7F], I:[0x00,0x41,0x7F,0x41,0x00],
+  J:[0x20,0x40,0x41,0x3F,0x01], K:[0x7F,0x08,0x14,0x22,0x41], L:[0x7F,0x40,0x40,0x40,0x40],
+  M:[0x7F,0x02,0x0C,0x02,0x7F], N:[0x7F,0x04,0x08,0x10,0x7F], O:[0x3E,0x41,0x41,0x41,0x3E],
+  P:[0x7F,0x09,0x09,0x09,0x06], Q:[0x3E,0x41,0x51,0x21,0x5E], R:[0x7F,0x09,0x19,0x29,0x46],
+  S:[0x46,0x49,0x49,0x49,0x31], T:[0x01,0x01,0x7F,0x01,0x01], U:[0x3F,0x40,0x40,0x40,0x3F],
+  V:[0x1F,0x20,0x40,0x20,0x1F], W:[0x3F,0x40,0x38,0x40,0x3F], X:[0x63,0x14,0x08,0x14,0x63],
+  Y:[0x03,0x04,0x78,0x04,0x03], Z:[0x61,0x51,0x49,0x45,0x43],
+  "0":[0x3E,0x51,0x49,0x45,0x3E], "1":[0x00,0x42,0x7F,0x40,0x00], "2":[0x42,0x61,0x51,0x49,0x46],
+  "3":[0x21,0x41,0x45,0x4B,0x31], "4":[0x18,0x14,0x12,0x7F,0x10], "5":[0x27,0x45,0x45,0x45,0x39],
+  "6":[0x3C,0x4A,0x49,0x49,0x30], "7":[0x01,0x71,0x09,0x05,0x03], "8":[0x36,0x49,0x49,0x49,0x36],
+  "9":[0x06,0x49,0x49,0x29,0x1E],
+  ":":[0x00,0x36,0x36,0x00,0x00], "-":[0x08,0x08,0x08,0x08,0x08],
+  ".":[0x00,0x60,0x60,0x00,0x00], " ":[0,0,0,0,0],
+};
+
+function createFB() {
+  const fb = new Uint8Array(128*64);
+  return {
+    fb,
+    px(x,y){ x|=0; y|=0; if(x>=0&&x<128&&y>=0&&y<64) fb[y*128+x]=1; },
+    clear(){ fb.fill(0); },
+    box(x,y,w,h){ for(let j=0;j<h;j++) for(let i=0;i<w;i++) this.px(x+i,y+j); },
+    rbox(x,y,w,h){ this.box(x,y,w,h); if(w>2&&h>2){ // u8g2 r=1：去掉四角像素
+      const c=[[x,y],[x+w-1,y],[x,y+h-1],[x+w-1,y+h-1]];
+      for(const[cx,cy]of c) fb[cy*128+cx]=0; } },
+    line(x0,y0,x1,y1){ const dx=Math.abs(x1-x0),dy=Math.abs(y1-y0),sx=x0<x1?1:-1,sy=y0<y1?1:-1;
+      let err=dx-dy; for(;;){ this.px(x0,y0); if(x0===x1&&y0===y1)break;
+      const e2=2*err; if(e2>-dy){err-=dy;x0+=sx;} if(e2<dx){err+=dx;y0+=sy;} } },
+    str(s,x,y){ // u8g2 drawStr：y 为基线，字形占 y-7..y-1
+      let cx=x;
+      for(const ch of s){
+        const g=FONT5x7[ch]||FONT5x7[" "];
+        for(let col=0;col<5;col++) for(let b=0;b<7;b++)
+          if(g[col]&(1<<b)) this.px(cx+col, y-7+b);
+        cx+=6;
+      } },
+  };
+}
+
+function renderFace(fb, core, debugOverlay) {
+  fb.clear();
+  const t = core.t, look = core.faceLook;
+  if (debugOverlay) {
+    const mlName = core.mlStable <= 4 ? core.ML_NAMES[core.mlStable] : "UNKNOWN";
+    fb.str(`S:${core.STATE_NAMES[core.state]} M:${mlName}`, 0, 7);
+    fb.str(`A:${core.POS_NAMES[core.position]} X:${core.r50.ok?Math.round(core.r50.x):0} Y:${core.r50.ok?Math.round(core.r50.y):0}`, 0, 63);
+  }
+  const ratio = Math.min(Math.max(look / FW.LOOK_MAX_PX, -1), 1);
+  const eye_sep = 52 - 14 * Math.abs(ratio);
+  const left_eye_x = Math.trunc(64 + look - eye_sep*0.5);
+  const right_eye_x = Math.trunc(64 + look + eye_sep*0.5);
+  const nose_x = Math.trunc(64 + look + 7*ratio);
+  const mouth_x = Math.trunc(64 + look + 4*ratio);
+  const eye_y = 23 + (core.eyeWiggle || 0);
+  drawEye(fb, left_eye_x, eye_y, core.eyeOpen, core.sleepy);
+  drawEye(fb, right_eye_x, eye_y, core.eyeOpen, core.sleepy);
+  fb.box(nose_x-1, 26, 3, 13);
+  if (core.noseDirection < 0) fb.box(nose_x-7, 37, 8, 3);
+  else fb.box(nose_x, 37, 8, 3);
+  drawMouth(fb, mouth_x, core.mouthMode);
+}
+function drawEye(fb, cx, cy, open, sleepy) {
+  if (sleepy || open <= 1) { fb.box(cx-4, cy, 8, 2); return; }
+  const h = Math.min(Math.max(open,2), FW.EYE_MAX_HEIGHT_PX);
+  fb.rbox(cx-4, cy - Math.floor(h/2), 8, h);
+}
+function drawMouth(fb, cx, mode) {
+  if (mode === "yawn") { fb.rbox(cx-6, 44, 12, 11); return; }  // 打哈欠的大 O
+  if (mode !== "smile") { fb.box(cx-14, 51, 28, 3); return; }
+  fb.rbox(cx-22, 46, 5, 5);
+  fb.rbox(cx+17, 46, 5, 5);
+  fb.box(cx-16, 51, 32, 4);
+  fb.line(cx-17, 50, cx-16, 51);
+  fb.line(cx+16, 51, cx+17, 50);
+}
+
+/* ============================================================
+ * 雷达环境模型：把"人"的位置变成 LD2450/LD2410/SR602 流
+ * ============================================================ */
+function createRadarModel(core, frameMs) {
+  const FRAME_MS = frameMs || 67; // LD2450 实际输出 ≈15Hz（采集 CSV 中位间隔实测）；旧固件处理速率仅 ≈7.6Hz
+  const PIR_MS = 100;            // 2410/602 读取周期
+  let frame_acc = 0, pir_acc = 0;
+  let person = { x: 0, y: 900, present: true };   // 人工输入的"真实"位置
+  let dragVX = 0, dragVY = 0, lastPos = null;
+  let trail = [];
+  let nx = 0, ny = 0;            // AR(1) 相关性噪声状态：真机跟踪器抖动是慢漂移
+  const gauss = () => (Math.random()+Math.random()+Math.random()+Math.random()-2)*1.732; // σ≈1
+  // 帧间相关性标定目标：静坐时 flt 步进(140ms)中位数 ≈5.5mm、σ≈8mm（2026-08-29 实测），
+  // 边际 σ≈100mm@0.7m 全部来自慢漂移 → ρ≈0.997@15Hz。
+  const RHO = 0.997;
+
+  function noiseSigma(y) { return Math.min(140, 20 + 60000/Math.max(y,150)); } // σ≈100mm@0.7m
+
+  function tick(dt, noise, srcPos) {
+    if (srcPos) { // 记录拖拽速度
+      if (lastPos) {
+        const dt2 = Math.max(dt,1);
+        dragVX = (srcPos.x-lastPos.x)/dt2*1000;
+        dragVY = (srcPos.y-lastPos.y)/dt2*1000;
+      }
+      lastPos = {x:srcPos.x, y:srcPos.y};
+      person.x = srcPos.x; person.y = srcPos.y; person.present = srcPos.present !== false;
+      person.v = srcPos.v;
+    }
+    frame_acc += dt; pir_acc += dt;
+    while (frame_acc >= FRAME_MS) {
+      frame_acc -= FRAME_MS;
+      if (person.present) {
+        const sig = noise ? noiseSigma(person.y) : 0;
+        nx = nx*RHO + gauss()*Math.sqrt(1-RHO*RHO)*sig;
+        ny = ny*RHO + gauss()*Math.sqrt(1-RHO*RHO)*sig;
+        const x = person.x + nx;
+        const y = person.y + ny;
+        // 静坐时真实 v 中位数为 0，只有约 0.7-3.1% 的行出现 8 的倍数尖峰
+        // （跟踪器毛刺，见 2026-08-09 采集 CSV 统计），不是连续白噪声。
+        let v = srcPos.v !== undefined ? srcPos.v
+              : Math.hypot(dragVX, dragVY)*(dragVX||dragVY?1:0);
+        if (noise && Math.random() < 0.025)
+          v += 8 * (1 + Math.floor(Math.random()*4)) * (Math.random()<0.5?-1:1);
+        core.ingest2450(Math.round(x), Math.round(y), Math.round(Math.abs(v)));
+      } else {
+        core.ingest2450Empty(); // 无目标帧
+      }
+    }
+    while (pir_acc >= PIR_MS) {
+      pir_acc -= PIR_MS;
+      const present = person.present && person.y < 3200;
+      const moving = Math.abs(dragVX) > 30 || Math.abs(dragVY) > 30;
+      const em = present ? Math.min(100, Math.round(Math.hypot(dragVX,dragVY)/12) + (noise?Math.round(Math.abs(gauss())*6):0)) : 0;
+      const es = present ? 70 + Math.round(gauss()*(noise?4:0)) : 0;
+      core.set2410(present, Math.max(0,em), Math.max(0,es));
+      core.setIR(person.present && person.y < 1000);
+      if (!person.present || (!moving)) { dragVX *= 0.55; dragVY *= 0.55; }
+    }
+    if (person.present) {
+      trail.push({x:person.x, y:person.y});
+      if (trail.length > 40) trail.shift();
+    }
+  }
+  return { tick, get person(){return person;},
+           set person(v){ if (!person || Math.hypot(v.x-person.x, v.y-person.y) > 400 ||
+                              v.present !== person.present) trail = [];
+                          person = v; },
+           get trail(){return trail;} };
+}
+
+/* ============================================================
+ * 场景剧本（keyframe 插值，循环播放）
+ * ============================================================ */
+const SCRIPTS = {
+  sit:    { name:"静坐工作", loop:30000, keys:[[0,0,900],[30000,0,905]] },
+  hello:  { name:"凑近打招呼", loop:12000, keys:[[0,0,1800],[3000,0,550],[7000,0,560],[9000,0,1500],[12000,0,1600]] },
+  peek:   { name:"左右探头", loop:14000, keys:[[0,0,900],[3500,-550,900],[7000,550,900],[10500,-400,950],[14000,0,900]] },
+  leave:  { name:"离开→回来", loop:26000, keys:[[0,0,900],[2500,100,1200],[4000,300,2700],[5000,320,2900],[14000,320,2950],[16000,0,1400],[18000,0,900],[26000,0,895]],
+            absent:[[5000,14000]] },
+  night:  { name:"深夜静止", loop:40000, keys:[[0,0,1000],[40000,0,1002]] },
+  stress: { name:"贴脸强噪声", loop:20000, keys:[[0,0,450],[20000,0,455]] },
+};
+function scriptPos(script, tMs) {
+  const T = script.loop, tt = tMs % T;
+  const keys = script.keys;
+  let a = keys[0], b = keys[keys.length-1];
+  for (let i=0;i<keys.length-1;i++) if (tt>=keys[i][0] && tt<=keys[i+1][0]) { a=keys[i]; b=keys[i+1]; break; }
+  const p = (tt-a[0])/Math.max(1,(b[0]-a[0]));
+  const x = a[1]+(b[1]-a[1])*p, y = a[2]+(b[2]-a[2])*p;
+  let present = true;
+  if (script.absent) for (const [s,e] of script.absent) if (tt>=s && tt<e) present = false;
+  return { x, y, present };  // 噪声统一由雷达模型按距离注入
+}
+
+/* ============================================================
+ * CSV 回放：t_global,x,y,v,em,es,action（training/sessions 格式）
+ * ============================================================ */
+function parseCSV(text) {
+  const rows = [];
+  const lines = text.split(/\r?\n/);
+  for (let i=1;i<lines.length;i++) {
+    const c = lines[i].split(",");
+    if (c.length < 6) continue;
+    const t = parseFloat(c[0]), x = parseFloat(c[1]), y = parseFloat(c[2]);
+    if (!isFinite(t) || !isFinite(x) || !isFinite(y)) continue;
+    rows.push({ t:t*1000, x, y, v:parseFloat(c[3])||0, em:parseFloat(c[4])||0, es:parseFloat(c[5])||0 });
+  }
+  rows.sort((a,b)=>a.t-b.t);
+  return rows;
+}
+
+/* ============================================================
+ * Node 无头测试出口（浏览器里无副作用）
+ * ============================================================ */
+if (typeof module !== "undefined" && typeof module.exports !== "undefined") {
+  Object.assign(module.exports, { FW, createSimCore, tinymlV0Predict, createRadarModel,
+    SCRIPTS, scriptPos, parseCSV, createFB, renderFace, STATE_NAMES, ML_NAMES, POS_NAMES, EV_NAMES });
+}
+
+/* ============================================================
+ * UI 装配（仅浏览器执行）
+ * ============================================================ */
+if (typeof window !== "undefined" && typeof document !== "undefined") (function(){
+  const core = createSimCore();
+  const radar = createRadarModel(core);
+  const fb = createFB();
+  const oled = document.getElementById("oled");
+  const oledMini = document.getElementById("oledMini");
+  const octx = oled.getContext("2d");
+  const mctx = oledMini.getContext("2d");
+  const field = document.getElementById("field");
+  const fctx = field.getContext("2d");
+  const serialEl = document.getElementById("serial");
+  let serialLines = [];
+
+  core.onLog = (tag, msg) => {
+    serialLines.push(`<span class="${tag==="st"?"st":tag==="ml"?"ml":tag==="ev"?"ev":""}">${msg}</span>`);
+    if (serialLines.length > 160) serialLines.shift();
+  };
+
+  // ── 输入源 ──
+  let mode = "manual", script = null, scriptT = 0, csvRows = null, csvT = 0, csvIdx = 0;
+  const modeHint = {
+    manual: "在下方俯视图里拖拽小人 = 人在雷达前移动；松手即静止。",
+    script: "选择一个场景剧本，循环播放；可同时开噪声。",
+    csv: "选择 training/sessions 里的雷达 CSV（t_global,x,y,v,em,es），按真实时间轴回放。",
+  };
+  function setMode(m) {
+    mode = m;
+    document.querySelectorAll("#modeBtns button").forEach(b => b.classList.toggle("on", b.dataset.mode===m));
+    document.getElementById("scriptRow").style.display = m==="script" ? "" : "none";
+    document.getElementById("csvRow").style.display = m==="csv" ? "" : "none";
+    document.getElementById("modeHint").textContent = modeHint[m];
+    if (m!=="script") script = null;
+    if (m!=="csv") csvRows = null;
+  }
+  document.querySelectorAll("#modeBtns button").forEach(b => b.onclick = () => setMode(b.dataset.mode));
+  document.querySelectorAll("#scriptBtns button").forEach(b => b.onclick = () => {
+    script = SCRIPTS[b.dataset.s]; scriptT = 0;
+    document.querySelectorAll("#scriptBtns button").forEach(x => x.classList.toggle("on", x===b));
+  });
+  document.getElementById("csvFile").onchange = e => {
+    const f = e.target.files[0]; if (!f) return;
+    f.text().then(txt => { csvRows = parseCSV(txt); csvT = 0; csvIdx = 0;
+      document.getElementById("modeHint").textContent = `已载入 ${f.name}：${csvRows.length} 行，时长 ${(csvRows.length?csvRows[csvRows.length-1].t/1000:0).toFixed(0)}s`; });
+  };
+
+  // ── 开关 ──
+  const swNoise = document.getElementById("swNoise");
+  const swLegacy = document.getElementById("swLegacy");
+  const swDebug = document.getElementById("swDebug");
+  swLegacy.onchange = () => { core.legacy = swLegacy.checked; };
+  document.getElementById("btnCal").onclick = () => core.calibrate();
+  let paused = false;
+  document.getElementById("btnPause").onclick = e => { paused = !paused; e.target.textContent = paused ? "继续" : "暂停"; };
+  document.getElementById("btnReset").onclick = () => { core.reset(); scriptT = 0; csvT = 0; csvIdx = 0; trailDrawDirty = true; };
+  let speed = 1;
+  document.getElementById("speed").onchange = e => speed = parseFloat(e.target.value);
+  document.getElementById("csvSpeed").onchange = e => csvSpeed = parseFloat(e.target.value);
+  let csvSpeed = 1;
+
+  // ── OLED 缩放（128×64 逻辑像素 ×3/×4/×5 整数放大；按视口自动选，可手动覆盖）──
+  function setScale(n) {
+    oled.style.width = 128*n + "px";
+    oled.style.height = 64*n + "px";
+    document.querySelectorAll("#scaleBtns button").forEach(x => x.classList.toggle("on", +x.dataset.s === n));
+  }
+  document.querySelectorAll("#scaleBtns button").forEach(b => b.onclick = () => setScale(+b.dataset.s));
+  setScale(window.innerWidth >= 1360 ? 5 : window.innerWidth >= 1080 ? 4 : 3);
+
+  // ── 俯视图画布自适应（属性尺寸跟随 CSS 盒子，保证拖拽映射与清晰度）──
+  function fitField() {
+    const r = field.getBoundingClientRect();
+    const w = Math.max(200, Math.round(r.width)), h = Math.max(120, Math.round(r.height));
+    if (field.width !== w || field.height !== h) { field.width = w; field.height = h; }
+  }
+  window.addEventListener("resize", fitField);
+
+  // ── 俯视图拖拽 ──
+  // 场地：X ±2.2m，Y 0.2–3.0m
+  const F = { xmin:-2200, xmax:2200, ymin:200, ymax:3000 };
+  function toField(xmm, ymm) {
+    const px = (xmm - F.xmin)/(F.xmax-F.xmin)*field.width;
+    const py = field.height - 26 - (ymm - F.ymin)/(F.ymax-F.ymin)*(field.height-60);
+    return [px, py];
+  }
+  function fromField(px, py) {
+    const xmm = px/field.width*(F.xmax-F.xmin)+F.xmin;
+    const ymm = (field.height-26-py)/(field.height-60)*(F.ymax-F.ymin)+F.ymin;
+    return [Math.min(F.xmax,Math.max(F.xmin,xmm)), Math.min(F.ymax,Math.max(F.ymin,ymm))];
+  }
+  let dragging = false;
+  function fieldPos(e) {
+    const r = field.getBoundingClientRect();
+    return [ (e.clientX-r.left)/r.width*field.width, (e.clientY-r.top)/r.height*field.height ];
+  }
+  field.addEventListener("pointerdown", e => { if (mode!=="manual") return; dragging = true; field.setPointerCapture(e.pointerId); });
+  field.addEventListener("pointermove", e => {
+    if (!dragging) return;
+    const [px,py] = fieldPos(e); const [x,y] = fromField(px,py);
+    radar.person = { x, y, present: true };
+  });
+  field.addEventListener("pointerup", () => dragging = false);
+
+  // ── 状态条 ──
+  const stateline = document.getElementById("stateline");
+  core.STATE_NAMES.forEach(n => { const b = document.createElement("b"); b.textContent = n; stateline.appendChild(b); });
+  const stateBtns = [...stateline.children];
+
+  // ── 读数 ──
+  const ro = id => document.getElementById(id);
+  const roState = ro("roState"), roML = ro("roML"), roPos = ro("roPos"),
+        roScore = ro("roScore"), roTrend = ro("roTrend"), roXY = ro("roXY");
+
+  // ── 渲染场地图 ──
+  function drawField() {
+    fitField();
+    fctx.fillStyle = "#101318"; fctx.fillRect(0,0,field.width,field.height);
+    // 雷达波束范围环
+    const [rx,ry] = toField(0,0);
+    fctx.strokeStyle = "#2b323c"; fctx.lineWidth = 1;
+    for (const r of [700, 1500, 2500]) {
+      fctx.beginPath();
+      fctx.arc(rx, ry, (r-F.ymin)/(F.ymax-F.ymin)*(field.height-60), Math.PI*1.22, Math.PI*1.78);
+      fctx.stroke();
+    }
+    fctx.fillStyle = "#3d444d"; fctx.fillRect(rx-16, ry-6, 32, 10);
+    fctx.fillStyle = "#7d8590"; fctx.font = "10px sans-serif"; fctx.fillText("LD2450", rx-18, ry+14);
+    // 轨迹
+    const tr = radar.trail;
+    if (tr.length > 1) {
+      fctx.strokeStyle = "rgba(126,231,135,.35)"; fctx.beginPath();
+      tr.forEach((p,i)=>{ const [x,y]=toField(p.x,p.y); i?fctx.lineTo(x,y):fctx.moveTo(x,y); });
+      fctx.stroke();
+    }
+    // 人
+    const p = radar.person;
+    if (p.present) {
+      const [x,y] = toField(p.x,p.y);
+      fctx.fillStyle = "#7ee787"; fctx.beginPath(); fctx.arc(x,y,9,0,Math.PI*2); fctx.fill();
+      fctx.fillStyle = "#0c0e11"; fctx.font="bold 10px sans-serif"; fctx.fillText("人", x-5, y+4);
+    } else {
+      fctx.fillStyle = "#f85149"; fctx.font = "12px sans-serif";
+      fctx.fillText("目标离场（模拟无回波）", 16, 24);
+    }
+    // 标尺
+    fctx.fillStyle = "#555c66"; fctx.font = "10px sans-serif";
+    fctx.fillText("左 -2.2m", 8, field.height-8);
+    fctx.fillText("右 +2.2m", field.width-52, field.height-8);
+    fctx.fillText("0.2m", rx+6, ry-8);
+  }
+
+  // ── 主循环 ──
+  let lastRAF = performance.now(), display_acc = 0, ro_acc = 0, field_acc = 0, trailDrawDirty = false;
+  function frame(now) {
+    requestAnimationFrame(frame);
+    let dt = Math.min(100, now - lastRAF) * speed;
+    lastRAF = now;
+    if (paused) dt = 0;
+
+    if (dt > 0) {
+      // 输入源驱动
+      if (mode === "script" && script) {
+        scriptT += dt;
+        radar.person = scriptPos(script, scriptT);
+        radar.tick(dt, swNoise.checked, radar.person);
+      } else if (mode === "csv" && csvRows && csvRows.length) {
+        csvT += dt * csvSpeed;
+        while (csvIdx < csvRows.length-1 && csvRows[csvIdx+1].t <= csvT) csvIdx++;
+        if (csvIdx >= csvRows.length-1) { csvT = 0; csvIdx = 0; }
+        const a = csvRows[csvIdx];
+        radar.person = { x:a.x, y:a.y, present:true };
+        radar.tick(dt, false, radar.person);
+        core.set2410(true, a.em, a.es);
+      } else {
+        radar.tick(dt, swNoise.checked, radar.person);
+      }
+      core.step(dt);
+    }
+
+    // OLED 重绘节拍 = 固件 DISPLAY_MS(80ms)，12.5Hz
+    display_acc += dt;
+    if (display_acc >= FW.DISPLAY_MS || trailDrawDirty) {
+      display_acc = 0; trailDrawDirty = false;
+      renderFace(fb, core, swDebug.checked);
+      const img = octx.createImageData(128,64);
+      const lum = Math.max(0.16, Math.min(1, core.contrast/170));
+      for (let i=0;i<128*64;i++) {
+        const v = fb.fb[i] ? Math.round(232*lum) : 8;
+        img.data[i*4]=v; img.data[i*4+1]=v; img.data[i*4+2]=v; img.data[i*4+3]=255;
+      }
+      octx.putImageData(img,0,0);
+      mctx.imageSmoothingEnabled = false;
+      mctx.clearRect(0,0,128,64);
+      mctx.drawImage(oled, 0,0,128,64);
+      octx.imageSmoothingEnabled = false;
+    }
+    // 俯视图 ~20Hz
+    field_acc += dt;
+    if (field_acc >= 50) { field_acc = 0; drawField(); }
+    // 读数 ~10Hz
+    ro_acc += dt;
+    if (ro_acc >= 100) {
+      ro_acc = 0;
+      const stName = core.STATE_NAMES[core.state];
+      roState.querySelector(".v").textContent = stName;
+      roState.className = "ro" + (core.state===4?" active":core.state===0?"":"");
+      const mlName = core.mlStable<=4 ? core.ML_NAMES[core.mlStable] : "—";
+      const mlCand = core.mlCandidate<=4 ? core.ML_NAMES[core.mlCandidate] : "—";
+      roML.querySelector(".v").textContent = `${mlName}`;
+      roML.title = `candidate: ${mlCand}`;
+      roPos.querySelector(".v").textContent = core.POS_NAMES[core.position];
+      roScore.querySelector(".v").textContent = `${core.motionScore} / 8`;
+      roScore.querySelector("i").style.width = (core.motionScore/8*100)+"%";
+      roTrend.querySelector(".v").textContent = core.yTrend.toFixed(1);
+      roTrend.querySelector("i").style.width = Math.min(100, Math.abs(core.yTrend)/30*100)+"%";
+      roXY.querySelector(".v").textContent = core.r50.ok ? `${core.flt.x.toFixed(0)} / ${core.flt.y.toFixed(0)}` : "—";
+      stateBtns.forEach((b,i)=>b.classList.toggle("cur", i===core.state));
+      serialEl.innerHTML = serialLines.slice(-160).join("\n");
+      serialEl.scrollTop = serialEl.scrollHeight;
+    }
+  }
+  requestAnimationFrame(frame);
+
+  // 调试钩子：控制台或自动化检查用，如 __sim.state()
+  window.__sim = {
+    state: () => ({ t: core.t, state: core.STATE_NAMES[core.state],
+                    ml: core.mlStable, score: core.motionScore,
+                    look: +core.faceLook.toFixed(1), serial: serialLines.length }),
+    core, radar,
+  };
+})();
+</script>
+</body>
+</html>

@@ -11,3 +11,4 @@ __pycache__/
 training/sessions/*.mp4
 training/sessions/*.csv
 training/sessions/*.json
+training/models/exported/
