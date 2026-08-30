@@ -1,5 +1,7 @@
 # HappyMac — TinyML 训练管线
 
+> 📋 **下一轮正式数据采集（装壳后）的流程/内容/质量门规范见 [DATA_COLLECTION_V2.md](DATA_COLLECTION_V2.md)**——开工前必读。V1 数据（`sessions/` 2026-08 八会话）体检结论与问题追踪也在这份文档里。
+
 ## 问题定义
 
 **跨模态蒸馏（Cross-modal Teacher-Student Distillation）**
