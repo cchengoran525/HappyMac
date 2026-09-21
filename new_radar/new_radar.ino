@@ -1,23 +1,38 @@
 // ============================================================
-//  HappyMac — new_radar.ino (TinyML 数据采集版)
+//  HappyMac — new_radar.ino (TinyML 数据采集版 — V2 collection)
 //
 //  功能：双雷达同时采样 + 串口 CSV 输出
-//    - LD2450: X/Y 坐标 + 速度（10Hz 目标数据）
+//    - LD2450: X/Y 坐标 + 速度（10Hz，3 目标全量）
 //    - LD2410C: 移动/静止能量 + 距离 + 存在标志
 //    - SR602: 红外二值信号
 //
 //  输出格式（115200 baud, USB CDC）：
-//    RADAR,<ms>,<x>,<y>,<v>,<em>,<es>,<d2410>,<pres>,<ir>
-//      ms    = 毫秒时间戳
-//      x,y,v = LD2450 坐标(mm) + 速度(cm/s)
-//      em,es = LD2410C moving/stationary energy
-//      d2410 = LD2410C 距离(cm)
-//      pres  = LD2410C presence (1/0)
-//      ir    = SR602 (1/0)
+//    RADAR,<ms>,<x>,<y>,<v>,<x2>,<y2>,<v2>,<x3>,<y3>,<v3>,<em>,<es>,<d2410>,<pres>,<ir>
+//      ms        = 毫秒时间戳
+//      x,y,v     = LD2450 目标 1 坐标(mm) + 速度(cm/s)
+//      x2,y2,v2  = LD2450 目标 2（无目标时为 0）
+//      x3,y3,v3  = LD2450 目标 3（无目标时为 0）
+//      em,es     = LD2410C moving/stationary energy
+//      d2410     = LD2410C 距离(cm)
+//      pres      = LD2410C presence (1/0)
+//      ir        = SR602 (1/0)
+//
+//  V2 变更（DATA_COLLECTION_V2.md）：
+//    1. FW_VERSION 宏 — 启动打印 + CSV 首行
+//    2. LD2410C 灵敏度 40/40（V1 为 80/80，宏可切换做 AB 实验）
+//    3. 3 目标全量 CSV（V1 只取第 1 目标）
 //
 //  硬件：ESP32-C3 SuperMini + SH1106 OLED + LD2450 + LD2410C + SR602
 //  烧录：CDCOnBoot=cdc（必须！v3 core 默认 USB CDC 关闭）
 // ============================================================
+
+// ─── 版本 & 可配宏 ────────────────────────────────────
+#define FW_VERSION "collection_v2.0"
+
+// LD2410C gate 0-3 灵敏度阈值（V1=80, V2=40; 改回 80 做 AB 对照）
+#ifndef LD2410_SENSITIVITY
+#define LD2410_SENSITIVITY 40
+#endif
 
 #include <Arduino.h>
 #include <Wire.h>
@@ -46,7 +61,9 @@ ld2410 radar2410;
 HardwareSerial radar2450(0);
 
 // ─── LD2450 ─────────────────────────────────────────
-int16_t  r50_x=0, r50_y=0, r50_v=0;
+int16_t  r50_x=0, r50_y=0, r50_v=0;    // 目标 1
+int16_t  r50_x2=0, r50_y2=0, r50_v2=0; // 目标 2
+int16_t  r50_x3=0, r50_y3=0, r50_v3=0; // 目标 3
 bool     r50_ok=false;
 uint32_t r50_last=0;
 
@@ -54,32 +71,44 @@ uint32_t r50_last=0;
 int  r10_em=0, r10_es=0, r10_dist=0;
 bool r10_pres=false;
 
-// ─── LD2450 帧解析 ──────────────────────────────────
+// ─── LD2450 帧解析（V2: 3 目标全量）──────────────────
 uint8_t b[64]; int bi=0;
 void parse2450(){
   while(radar2450.available()){
     b[bi++]=radar2450.read();
     if(bi>=30){
       if(b[0]==0xAA&&b[1]==0xFF&&b[2]==0x03&&b[3]==0x00&&b[28]==0x55&&b[29]==0xCC){
+        // 清零所有目标
+        r50_x=0; r50_y=0; r50_v=0;
+        r50_x2=0; r50_y2=0; r50_v2=0;
+        r50_x3=0; r50_y3=0; r50_v3=0;
         r50_ok=false;
+
+        int16_t* targets_x[] = {&r50_x, &r50_x2, &r50_x3};
+        int16_t* targets_y[] = {&r50_y, &r50_y2, &r50_y3};
+        int16_t* targets_v[] = {&r50_v, &r50_v2, &r50_v3};
+
         for(int t=0;t<3;t++){
           int o=4+t*8;
           int16_t rx=b[o]|b[o+1]<<8, ry=b[o+2]|b[o+3]<<8, rv=b[o+4]|b[o+5]<<8;
           int x=(rx&0x8000)?(rx&0x7FFF):-(rx&0x7FFF);
           int y=(ry&0x8000)?(ry&0x7FFF):-(ry&0x7FFF);
           int v=(rv&0x8000)?(rv&0x7FFF):-(rv&0x7FFF);
-          if(!(x==0&&y==0)){
-            r50_x= x; r50_y=y; r50_v=v; r50_ok=true;  // 竖放方向: 左小右大
+          *targets_x[t] = x;
+          *targets_y[t] = y;
+          *targets_v[t] = v;
+          if(!(x==0&&y==0)) r50_ok=true;
+        }
 
-            // ── EMA 滤波 ──
-            if(!flt_ok){flt_x=x; flt_y=y; flt_ok=true;}
-            else{
-              flt_x=EMA_A*x+(1.0f-EMA_A)*flt_x;
-              flt_y=EMA_A*y+(1.0f-EMA_A)*flt_y;
-            }
-            break;
+        // EMA 滤波（仅对主目标）
+        if(r50_ok && !(r50_x==0&&r50_y==0)){
+          if(!flt_ok){flt_x=r50_x; flt_y=r50_y; flt_ok=true;}
+          else{
+            flt_x=EMA_A*r50_x+(1.0f-EMA_A)*flt_x;
+            flt_y=EMA_A*r50_y+(1.0f-EMA_A)*flt_y;
           }
         }
+
         r50_last=millis(); bi=0;
       }else{memmove(b,b+1,--bi);}
     }
@@ -116,6 +145,9 @@ void checkCmd() {
       cmd_state = 0; cmd_phase[0] = 0;
     } else if (s == "SYNC") {
       Serial.printf("!SYNC,%lu\n", millis());  // 回复时间戳给电脑
+    } else if (s == "START") {
+      // 记录正式录制起点；上位机同时保存自己的墙钟时间。
+      Serial.printf("!START,%lu\n", millis());
     }
   }
   if (cmd_state && millis() > cmd_expiry) {
@@ -131,15 +163,14 @@ void setup(){
   oled.drawStr(15,20,"HappyMac"); oled.drawStr(0,36,"2-radar collect");
   oled.sendBuffer();
 
-  // LD2410C — 配置高灵敏度
+  // LD2410C — 配置灵敏度（V2: 40/40 恢复 Em 通道）
   Serial1.begin(RADAR_BAUD,SERIAL_8N1,PIN_2410_RX,PIN_2410_TX);
   {unsigned long t=millis()+2000; while(millis()<t) while(Serial1.available())Serial1.read();}
   if(radar2410.begin(Serial1)){
     Serial.println("[2410] OK");
-    // 拉高近距离 gate 灵敏度（桌面尺度用 gate 0-3 ≈ 0-2.25m）
     delay(100);
-    for(int g=0;g<4;g++) radar2410.setGateSensitivityThreshold(g,80,80);
-    Serial.println("[2410] sensitivity: gates 0-3 = 80/80");
+    for(int g=0;g<4;g++) radar2410.setGateSensitivityThreshold(g,LD2410_SENSITIVITY,LD2410_SENSITIVITY);
+    Serial.printf("[2410] sensitivity: gates 0-3 = %d/%d\n", LD2410_SENSITIVITY, LD2410_SENSITIVITY);
   }else{Serial.println("[2410] WARN");}
 
   // LD2450
@@ -153,7 +184,8 @@ void setup(){
     delay(50);
   }
 
-  Serial.println("CSV: ms,x,y,v,em,es,d2410,pres,ir");
+  Serial.printf("!FW_VERSION,%s\n", FW_VERSION);
+  Serial.println("CSV: ms,x,y,v,x2,y2,v2,x3,y3,v3,em,es,d2410,pres,ir");
 }
 
 // ─── loop ───────────────────────────────────────────
@@ -240,9 +272,11 @@ void loop(){
   if(Serial && ++serial_skip>=2){  // 每 2 帧发一次，降低缓冲压力
     serial_skip=0;
     if(Serial.availableForWrite()>80){  // 确保有空间，避免阻塞
-      Serial.printf("RADAR,%lu,%d,%d,%d,%d,%d,%d,%d,%d\n",
+      Serial.printf("RADAR,%lu,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d\n",
         millis(),
         r50_ok?r50_x:0, r50_ok?r50_y:0, r50_ok?r50_v:0,
+        r50_ok?r50_x2:0, r50_ok?r50_y2:0, r50_ok?r50_v2:0,
+        r50_ok?r50_x3:0, r50_ok?r50_y3:0, r50_ok?r50_v3:0,
         r10_em, r10_es, r10_dist,
         r10_pres?1:0, ir?1:0);
     }

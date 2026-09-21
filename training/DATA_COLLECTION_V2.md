@@ -28,16 +28,37 @@ V2 要回答的问题（按优先级）：
 ## 1. 采集前固件与工具准备（前置条件，缺一不开工）
 
 ### 1.1 采集固件（new_radar.ino 或新开 collection_v2 分支）改动
-- [ ] LD2410C gate 0-3 灵敏度阈值 **80/80 → 40/40**（V1 值也保留为编译期宏，方便对照实验）
-- [ ] `parse2450` 输出**全部 3 个目标**：CSV 列扩展为
+- [x] LD2410C gate 0-3 灵敏度阈值 **80/80 → 40/40**（V1 值也保留为编译期宏，方便对照实验）
+- [x] `parse2450` 输出**全部 3 个目标**：CSV 列扩展为
       `t_global,x,y,v,x2,y2,v2,x3,y3,v3,em,es,action`（无第二/三目标时填 0）
-- [ ] 固件版本号 `FW_VERSION` 宏，串口启动时打印，写入 CSV 首行注释或 meta
+- [x] 固件版本号 `FW_VERSION` 宏，串口启动时打印，写入 meta
+- [x] 增加 `!START,<c3_ms>` 正式录制起点标记
 - [ ] S3 竖直朝向固定（加装定位件），`/status` 返回 orientation 字段
 
 ### 1.2 上位机（collect.py）
-- [ ] 支持新的 3 目标 CSV 列
-- [ ] 每场自动写 `_meta.json`：固件版本、灵敏度配置、orientation、几何登记（§2.3）、噪声基线
-- [ ] 结束时自动跑质量门快检（§5），终端直接显示 PASS/FAIL
+- [x] 支持新的 3 目标 CSV 列（`training/v2_io.py`，V1/V2 自动识别）
+- [x] 采集行保留 C3 `c3_ms` 与主机 `host_ts`
+- [x] 每场自动写 `_meta.json`：固件版本、同步标记、质量摘要
+- [x] `collect_session.py --v2` 输出到独立 `sessions_v2/`，不覆盖 V1
+- [x] `align_v2_sessions.py` 用同一主机时间轴直接对齐视频和雷达
+- [x] 结束时自动跑质量门快检（§5），终端直接显示 PASS/FAIL
+
+V2 采集命令：
+
+```bash
+python training/collect_session.py --v2 \
+  --port /dev/cu.usbmodem2101 \
+  --orientation upright \
+  --geometry 'height_mm=?,pitch_deg=?,azimuth_deg=?'
+```
+
+采集完成后先对齐并检查：
+
+```bash
+python training/align_v2_sessions.py --session YYYYMMDD_HHMMSS
+```
+
+注意：V2 固件必须和 `--v2` 主机采集器一起使用；不要用旧的 V1 解析脚本直接接收三目标 CSV。
 
 ### 1.3 版本冻结纪律
 - 采集轮次期间**禁止**改任何固件参数/灵敏度/安装几何；确需改动 → 当前会话作废、meta 记录变更、重新开始本轮

@@ -54,6 +54,7 @@ HappyMac — 数据采集脚本（Teacher-Student 跨模态蒸馏）
 
 import argparse
 import csv
+import json
 import queue
 import re
 import sys
@@ -67,11 +68,17 @@ import numpy as np
 import serial
 import urllib.request
 
+from v2_io import parse_control_line, parse_radar_line, quality_gate, quality_summary
+
 # MediaPipe
 import mediapipe as mp
 from mediapipe.tasks import python as mp_python
 from mediapipe.tasks.python import vision as mp_vision
-from mediapipe import solutions as mp_solutions
+try:
+    # MediaPipe 0.x 提供 solutions；新版精简包可能只有 tasks。
+    from mediapipe import solutions as mp_solutions
+except ImportError:
+    mp_solutions = None
 
 # ─── 配置 ────────────────────────────────────────────
 from config import *
@@ -248,6 +255,10 @@ class RadarReader(threading.Thread):
         self.q = data_q
         self.stop = stop_event
         self.samples = 0
+        self.fw_version = None
+        self.sync_events = []
+        self.start_events = []
+        self.quality_rows = []
 
     def run(self):
         while not self.stop.is_set():
@@ -256,25 +267,33 @@ class RadarReader(threading.Thread):
                 print(f"[radar] 已连接 {self.port}")
                 while not self.stop.is_set():
                     line = ser.readline().decode(errors="replace").strip()
+                    control = parse_control_line(line)
+                    if control:
+                        if control["type"] == "fw_version":
+                            self.fw_version = control["version"]
+                        elif control["type"] == "sync":
+                            self.sync_events.append({
+                                "host_ts": time.time(),
+                                "c3_ms": control["c3_ms"],
+                            })
+                        elif control["type"] == "start":
+                            self.start_events.append({
+                                "host_ts": time.time(),
+                                "c3_ms": control["c3_ms"],
+                            })
+                        continue
                     if line.startswith("RADAR,"):
                         ts = time.time()
-                        # 格式: RADAR,ms,x,y,v,em,es,d,pres,ir
-                        parts = line.split(",")
-                        if len(parts) >= 10:
-                            try:
-                                data = {
-                                    "ts_local": ts,
-                                    "ms": int(parts[1]),
-                                    "x": int(parts[2]), "y": int(parts[3]),
-                                    "v": int(parts[4]),
-                                    "em": int(parts[5]), "es": int(parts[6]),
-                                    "d2410": int(parts[7]),
-                                    "pres": int(parts[8]), "ir": int(parts[9]),
-                                }
+                        try:
+                            data = parse_radar_line(line, host_ts=ts)
+                            if data is not None:
+                                data["ts_local"] = ts  # V1 兼容别名
+                                data["ms"] = data["c3_ms"]  # V1 兼容别名
                                 self.q.put(data)
+                                self.quality_rows.append(data)
                                 self.samples += 1
-                            except ValueError:
-                                pass
+                        except (TypeError, ValueError):
+                            pass
                 ser.close()
             except Exception as e:
                 if not self.stop.is_set():
@@ -324,8 +343,11 @@ def run_collection(duration: float, show_preview: bool, out_path: Path,
     f = open(out_path, "w", newline="")
     writer = csv.writer(f)
     header = [
-        "ts_video", "ts_radar_ms",
-        "x", "y", "v", "em", "es", "d2410", "pres", "ir",
+        "ts_video", "ts_radar_ms", "ts_radar_host", "radar_match_delta_s",
+        "alignment_valid",
+        "radar_format",
+        "x", "y", "v", "x2", "y2", "v2", "x3", "y3", "v3",
+        "em", "es", "d2410", "pres", "ir",
         "head_x", "head_y", "head_z",
         "head_yaw", "head_pitch", "head_roll",
         "face_bbox_x", "face_bbox_y", "face_bbox_w", "face_bbox_h",
@@ -384,6 +406,8 @@ def run_collection(duration: float, show_preview: bool, out_path: Path,
                 # 构建 3D 和 2D 关键点
                 idxs = [1, 152, 33, 263, 61, 291]
                 try:
+                    if mp_solutions is None:
+                        raise RuntimeError("MediaPipe solutions API unavailable")
                     pts_3d = np.float32([[
                         mp_solutions.face_mesh_connections.FACEMESH_TESSELATION
                         # 实际上需要 model 的 3D 坐标
@@ -475,21 +499,27 @@ def run_collection(duration: float, show_preview: bool, out_path: Path,
                 # 如果没有精确匹配，取最近的
                 if best_r is None and radar_buffer:
                     best_r = min(radar_buffer.values(),
-                                 key=lambda r: abs(r["ts_local"] - video_ts))
+                                 key=lambda r: abs(r["host_ts"] - video_ts))
             else:
                 best_r = None
 
             # 6. 写一行
             if best_r:
                 row = [
-                    f"{video_ts:.6f}", best_r["ms"],
+                    f"{video_ts:.6f}", best_r["c3_ms"],
+                    f"{best_r['host_ts']:.6f}",
+                    f"{abs(best_r['host_ts'] - video_ts):.6f}",
+                    int(abs(best_r['host_ts'] - video_ts) <= MAX_TIME_DELTA),
+                    best_r.get("radar_format", "unknown"),
                     best_r["x"], best_r["y"], best_r["v"],
+                    best_r["x2"], best_r["y2"], best_r["v2"],
+                    best_r["x3"], best_r["y3"], best_r["v3"],
                     best_r["em"], best_r["es"], best_r["d2410"],
                     best_r["pres"], best_r["ir"],
                 ]
             else:
-                row = [f"{video_ts:.6f}", 0,
-                       0, 0, 0, 0, 0, 0, 0, 0]
+                row = [f"{video_ts:.6f}", 0, "", "", 0, "unknown",
+                       0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
 
             row += [
                 f"{head_data['head_x']:.4f}",
@@ -512,7 +542,7 @@ def run_collection(duration: float, show_preview: bool, out_path: Path,
             # 7. 预览
             if show_preview:
                 # 在画面上叠加 info
-                if result.face_landmarks:
+                if result.face_landmarks and mp_solutions is not None:
                     # 画脸部轮廓
                     for conn in mp_solutions.face_mesh.FACEMESH_TESSELATION:
                         idx1, idx2 = conn
@@ -548,6 +578,20 @@ def run_collection(duration: float, show_preview: bool, out_path: Path,
         landmarker.close()
 
     elapsed = time.time() - t_start
+    summary = quality_summary(radar.quality_rows)
+    meta = {
+        "format": "collect.py_v2_compatible",
+        "output": str(out_path),
+        "fw_version": radar.fw_version,
+        "sync_events": radar.sync_events,
+        "start_events": radar.start_events,
+        "n_video_rows": row_count,
+        "n_radar_seen": radar.samples,
+        "quality": summary,
+        "quality_gate": quality_gate(summary),
+    }
+    out_path.with_name(out_path.stem + "_meta.json").write_text(
+        json.dumps(meta, ensure_ascii=False, indent=2) + "\n")
     print(f"[main] 完成: {row_count} 行, {elapsed:.0f} 秒")
     print(f"[main] 输出: {out_path}")
 

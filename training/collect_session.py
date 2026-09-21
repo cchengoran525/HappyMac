@@ -8,14 +8,18 @@ S3 摄像头 + C3 双雷达同步录制
      python collect_session.py
 """
 
+import argparse
 import csv, json, queue, sys, threading, time, cv2, serial, urllib.request
 import numpy as np
 from pathlib import Path
 from datetime import datetime
 
+from v2_io import parse_control_line, parse_radar_line, quality_gate, quality_summary
+
 S3_URL    = "http://192.168.4.1/stream"
 RADAR_PORT = "/dev/cu.usbmodem2101"
 OUT_DIR   = Path(__file__).resolve().parent / "sessions"
+V2_OUT_DIR = Path(__file__).resolve().parent / "sessions_v2"
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # ═══════════════════════════════════════════════════════
@@ -52,18 +56,61 @@ ACTIONS = [
 
 ]
 
+ACTIONS_V2 = [
+    ("empty_table",   "EMPTY TABLE 60s", 60,
+     "Leave the scene completely empty. Noise and ABSENT baseline."),
+    ("still_30s",     "STILL 30s",       30,
+     "Sit still. Hands on lap. Breathe normally."),
+    ("natural_typing", "TYPE NATURALLY", 45,
+     "Type naturally. Look at the screen, not at the radar."),
+    ("slow_sweep",    "SLOW SWEEP L<>R", 20,
+     "Smooth large left-right body movement."),
+    ("quick_points",  "QUICK L . R . L", 20,
+     "Quick left/right points with short stops."),
+    ("ellipse",        "ELLIPSE MOTION", 20,
+     "Draw an ellipse with the upper body."),
+    ("fwd_back",      "FWD <> BACK",     20,
+     "Lean forward, return, lean back, return."),
+    ("head_only",     "HEAD ONLY TURN",  30,
+     "Body still; turn head toward the radar and left/right."),
+    ("turn_toward",   "TURN TOWARD",     20,
+     "Randomly turn toward the device with slight body lean."),
+    ("big_sway",      "BIG SWAY",        20,
+     "Large lateral movement, approximately ±50 cm."),
+    ("still_near",    "STILL NEAR",      15,
+     "Sit still near the device, approximately 0.5 m."),
+    ("still_far",     "STILL FAR",       15,
+     "Sit still far from the device, approximately 1.5 m."),
+    ("natural_reach", "REACH & GRAB",    20,
+     "Reach for objects naturally."),
+    ("stand_sit",     "STAND <> SIT",    20,
+     "Stand and sit repeatedly."),
+]
+
 # ═══════════════════════════════════════════════════════
 
 class SessionCollector:
-    def __init__(self, ts):
+    def __init__(self, ts, *, v2=False, radar_port=RADAR_PORT,
+                 s3_url=S3_URL, out_dir=OUT_DIR, warmup_sec=180,
+                 geometry="", orientation="upright"):
         self.ts = ts
+        self.v2 = v2
+        self.radar_port = radar_port
+        self.s3_url = s3_url
+        self.out_dir = Path(out_dir)
+        self.warmup_sec = warmup_sec
+        self.geometry = geometry
+        self.orientation = orientation
         self.radar_q = queue.Queue()
         self.stop = threading.Event()
         self.all_radar = []
         self.action_log = []
+        self.fw_version = None
+        self.sync_events = []
+        self.start_events = []
 
         # Radar serial — 禁用 DTR/RTS 防止误复位 C3
-        self.ser = serial.Serial(RADAR_PORT, 115200, timeout=0.3)
+        self.ser = serial.Serial(self.radar_port, 115200, timeout=0.3)
         self.ser.setDTR(False)
         self.ser.setRTS(False)
         time.sleep(1)
@@ -72,8 +119,13 @@ class SessionCollector:
         t_wait = time.time()
         while time.time() - t_wait < 3:
             l = self.ser.readline().decode(errors='replace').strip()
-            if l.startswith('!SYNC,'):
-                self.sync_ms = int(l.split(',')[1])
+            control = parse_control_line(l)
+            if control and control["type"] == "fw_version":
+                self.fw_version = control["version"]
+            elif control and control["type"] == "sync":
+                self.sync_ms = control["c3_ms"]
+                self.sync_events.append({"host_ts": time.time(),
+                                         "c3_ms": self.sync_ms})
                 print(f"[SYNC] C3 replies: ms={self.sync_ms}")
                 break
         threading.Thread(target=self._radar_thread, daemon=True).start()
@@ -81,8 +133,8 @@ class SessionCollector:
         # ── 雷达预热 3 分钟（冷启动漂移期，已实测确认）──
         print("\n[WARMUP] 雷达预热 180 秒（冷启动噪声期，请静置）")
         t_warm = time.time()
-        while time.time() - t_warm < 180:
-            remaining = 180 - int(time.time() - t_warm)
+        while time.time() - t_warm < self.warmup_sec:
+            remaining = self.warmup_sec - int(time.time() - t_warm)
             print(f"\r[WARMUP] 剩余 {remaining:3d}s    ", end="", flush=True)
             time.sleep(1)
         print("\n[WARMUP] 完成，开始正式采集\n")
@@ -93,42 +145,66 @@ class SessionCollector:
             except queue.Empty: break
 
         # S3 stream
-        print(f"[S3] connecting {S3_URL}...")
-        self.stream = urllib.request.urlopen(S3_URL, timeout=5)
+        print(f"[S3] connecting {self.s3_url}...")
+        self.stream = urllib.request.urlopen(self.s3_url, timeout=5)
         self.stream_buf = b""
         print("[S3] connected")
 
         # Video writer
-        self.video_path = OUT_DIR / f"session_{ts}.mp4"
+        self.out_dir.mkdir(parents=True, exist_ok=True)
+        self.video_path = self.out_dir / f"session_{ts}.mp4"
         self.writer = cv2.VideoWriter(
             str(self.video_path), cv2.VideoWriter_fourcc(*'mp4v'), 10, (640, 480))
 
         # Radar CSV
-        self.csv_path = OUT_DIR / f"session_{ts}.csv"
+        self.csv_path = self.out_dir / f"session_{ts}.csv"
         self.csv_f = open(self.csv_path, 'w', newline='')
         self.csv_w = csv.writer(self.csv_f)
-        self.csv_w.writerow(['t_global','x','y','v','em','es','action'])
+        if self.v2:
+            self.csv_w.writerow([
+                't_global', 'host_ts', 'c3_ms',
+                'x', 'y', 'v', 'x2', 'y2', 'v2', 'x3', 'y3', 'v3',
+                'em', 'es', 'd2410', 'pres', 'ir', 'action'
+            ])
+        else:
+            self.csv_w.writerow(['t_global','x','y','v','em','es','action'])
 
         # Video timestamp log（每帧的墙钟时间戳）
-        self.vid_ts_path = OUT_DIR / f"session_{ts}_vidts.csv"
+        self.vid_ts_path = self.out_dir / f"session_{ts}_vidts.csv"
         self.vid_ts_f = open(self.vid_ts_path, 'w')
         self.vid_ts_f.write("t_wallclock,action\n")
 
         self.t_start = time.time()
+        self.record_start_host = self.t_start
+        # 这是正式录制起点标记，不代替硬件同步，但可用于审计 C3/主机时钟关系。
+        self.ser.write(b'!START\n')
 
     def _radar_thread(self):
         while not self.stop.is_set():
             try:
                 l = self.ser.readline().decode(errors='replace').strip()
+                control = parse_control_line(l)
+                if control:
+                    now = time.time()
+                    if control["type"] == "fw_version":
+                        self.fw_version = control["version"]
+                    elif control["type"] == "sync":
+                        self.sync_events.append({"host_ts": now,
+                                                 "c3_ms": control["c3_ms"]})
+                    elif control["type"] == "start":
+                        self.start_events.append({"host_ts": now,
+                                                  "c3_ms": control["c3_ms"]})
+                    continue
                 if l.startswith('RADAR,'):
-                    p = l.split(',')
-                    if len(p) >= 9:
-                        self.radar_q.put({
-                            't': time.time(),
-                            'x': int(p[2]), 'y': int(p[3]), 'v': int(p[4]),
-                            'em': int(p[5]), 'es': int(p[6])
-                        })
-            except: time.sleep(0.01)
+                    now = time.time()
+                    parsed = parse_radar_line(l, host_ts=now)
+                    if parsed:
+                        parsed['t'] = now       # V1 兼容别名
+                        self.radar_q.put(parsed)
+            except (TypeError, ValueError):
+                time.sleep(0.01)
+            except Exception:
+                time.sleep(0.01)
 
     def oled(self, cmd):
         self.ser.write((cmd + '\n').encode())
@@ -179,12 +255,23 @@ class SessionCollector:
 
             # Write radar CSV（用雷达到达时间，不是视频时间！）
             if radar_latest:
-                self.csv_w.writerow([
-                    f"{radar_latest['t'] - (self.sync_ts or self.t_start):.3f}",
-                    radar_latest['x'], radar_latest['y'],
-                    radar_latest['v'], radar_latest['em'], radar_latest['es'],
-                    key
-                ])
+                if self.v2:
+                    self.csv_w.writerow([
+                        f"{radar_latest['host_ts'] - self.record_start_host:.6f}",
+                        f"{radar_latest['host_ts']:.6f}", radar_latest['c3_ms'],
+                        radar_latest['x'], radar_latest['y'], radar_latest['v'],
+                        radar_latest['x2'], radar_latest['y2'], radar_latest['v2'],
+                        radar_latest['x3'], radar_latest['y3'], radar_latest['v3'],
+                        radar_latest['em'], radar_latest['es'], radar_latest['d2410'],
+                        radar_latest['pres'], radar_latest['ir'], key
+                    ])
+                else:
+                    self.csv_w.writerow([
+                        f"{radar_latest['t'] - (self.sync_ts or self.t_start):.3f}",
+                        radar_latest['x'], radar_latest['y'],
+                        radar_latest['v'], radar_latest['em'], radar_latest['es'],
+                        key
+                    ])
 
             # Write video timestamp log（墙钟时间）
             if frame is not None:
@@ -258,13 +345,30 @@ class SessionCollector:
         self.csv_f.close()
         with open(self.csv_path, 'w', newline='') as f:
             w = csv.writer(f)
-            w.writerow(['t_global', 'x', 'y', 'v', 'em', 'es', 'action'])
-            t_ref = self.sync_ts or self.t_start
-            for r in self.all_radar:
+            if self.v2:
                 w.writerow([
-                    f"{r['t'] - t_ref:.3f}",
-                    r['x'], r['y'], r['v'], r['em'], r['es'], r.get('action', '')
+                    't_global', 'host_ts', 'c3_ms',
+                    'x', 'y', 'v', 'x2', 'y2', 'v2', 'x3', 'y3', 'v3',
+                    'em', 'es', 'd2410', 'pres', 'ir', 'action'
                 ])
+                for r in self.all_radar:
+                    w.writerow([
+                        f"{r['host_ts'] - self.record_start_host:.6f}",
+                        f"{r['host_ts']:.6f}", r['c3_ms'],
+                        r['x'], r['y'], r['v'],
+                        r['x2'], r['y2'], r['v2'],
+                        r['x3'], r['y3'], r['v3'],
+                        r['em'], r['es'], r['d2410'], r['pres'], r['ir'],
+                        r.get('action', '')
+                    ])
+            else:
+                w.writerow(['t_global', 'x', 'y', 'v', 'em', 'es', 'action'])
+                t_ref = self.sync_ts or self.t_start
+                for r in self.all_radar:
+                    w.writerow([
+                        f"{r['t'] - t_ref:.3f}",
+                        r['x'], r['y'], r['v'], r['em'], r['es'], r.get('action', '')
+                    ])
 
         self.vid_ts_f.close()
         self.writer.release()
@@ -272,15 +376,30 @@ class SessionCollector:
         cv2.destroyAllWindows()
 
         # Save summary
-        summary_path = OUT_DIR / f"session_{self.ts}_summary.json"
+        summary_path = self.out_dir / f"session_{self.ts}_summary.json"
+        quality = quality_summary(self.all_radar) if self.v2 else None
+        summary = {
+            'timestamp': self.ts,
+            'format': 'v2' if self.v2 else 'v1',
+            'fw_version': self.fw_version,
+            's3_url': self.s3_url,
+            'radar_port': self.radar_port,
+            'orientation': self.orientation,
+            'geometry': self.geometry,
+            'warmup_sec': self.warmup_sec,
+            'record_start_host': self.record_start_host,
+            'sync_events': self.sync_events,
+            'start_events': self.start_events,
+            'n_total_radar': len(self.all_radar),
+            'actions': self.action_log,
+            'quality': quality,
+            'quality_gate': quality_gate(quality) if quality else None,
+        }
         with open(summary_path, 'w') as f:
-            json.dump({
-                'timestamp': self.ts,
-                's3_url': S3_URL,
-                'radar_port': RADAR_PORT,
-                'n_total_radar': len(self.all_radar),
-                'actions': self.action_log
-            }, f, indent=2)
+            json.dump(summary, f, indent=2)
+        if self.v2:
+            meta_path = self.out_dir / f"session_{self.ts}_meta.json"
+            meta_path.write_text(json.dumps(summary, indent=2, ensure_ascii=False) + "\n")
 
         print(f"\n{'='*55}")
         print(f"  SESSION COMPLETE")
@@ -289,6 +408,14 @@ class SessionCollector:
         print(f"  雷达: {self.csv_path}")
         print(f"  摘要: {summary_path}")
         print(f"  总雷达帧: {len(self.all_radar)}")
+        if quality is not None:
+            gate = quality_gate(quality)
+            print(f"  V2 quality gate: {'PASS' if gate['pass'] else 'FAIL'}")
+            print(f"  rate={quality['frame_rate_hz']:.2f}Hz  "
+                  f"max_gap={quality['max_gap_sec']}s  "
+                  f"Em>0={quality['em_active_fraction']:.1%}  "
+                  f"target2={quality['target2_nonzero_fraction']:.1%}  "
+                  f"target3={quality['target3_nonzero_fraction']:.1%}")
 
         # Print action summary table
         print(f"\n{'Action':<20} {'Radar':>6} {'X_mean':>7} {'X_std':>6} {'Y_mean':>7} {'Y_std':>6} {'Em%':>5} {'Es%':>5}")
@@ -299,24 +426,45 @@ class SessionCollector:
 
 
 def main():
+    parser = argparse.ArgumentParser(description="HappyMac V1/V2 session collector")
+    parser.add_argument("--v2", action="store_true",
+                        help="使用 V2 三目标格式、sessions_v2 和 V2 动作协议")
+    parser.add_argument("--port", default=RADAR_PORT, help="C3 串口")
+    parser.add_argument("--camera", default=S3_URL, help="S3 MJPEG 地址")
+    parser.add_argument("--out-dir", default=None, help="输出目录")
+    parser.add_argument("--warmup", type=int, default=180,
+                        help="雷达预热秒数，V2 默认 180")
+    parser.add_argument("--orientation", default="upright",
+                        help="视频方向元数据")
+    parser.add_argument("--geometry", default="",
+                        help="安装几何登记文本或 JSON 字符串")
+    args = parser.parse_args()
+
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     print(f"\n{'='*55}")
     print(f"  HappyMac 完整采集 Session")
     print(f"  {ts}")
     print(f"{'='*55}")
-    print(f"  S3:  {S3_URL}")
-    print(f"  C3:  {RADAR_PORT}")
-    print(f"  动作: {len(ACTIONS)} 个")
-    total_sec = sum(a[2] for a in ACTIONS)
+    actions = ACTIONS_V2 if args.v2 else ACTIONS
+    out_dir = Path(args.out_dir) if args.out_dir else (V2_OUT_DIR if args.v2 else OUT_DIR)
+    print(f"  模式: {'V2' if args.v2 else 'V1'}")
+    print(f"  S3:  {args.camera}")
+    print(f"  C3:  {args.port}")
+    print(f"  输出: {out_dir}")
+    print(f"  动作: {len(actions)} 个")
+    total_sec = sum(a[2] for a in actions)
     print(f"  总时长: ~{total_sec//60}min {total_sec%60}s")
     print(f"\n  准备: WiFi 连 HappyMac-S3, C3 插 USB")
     print(f"  按 Enter 开始...")
     input()
 
-    collector = SessionCollector(ts)
+    collector = SessionCollector(
+        ts, v2=args.v2, radar_port=args.port, s3_url=args.camera,
+        out_dir=out_dir, warmup_sec=args.warmup,
+        geometry=args.geometry, orientation=args.orientation)
 
     try:
-        for key, name, dur, desc in ACTIONS:
+        for key, name, dur, desc in actions:
             collector.run_action(key, name, dur, desc)
     except KeyboardInterrupt:
         print("\n[interrupted]")
