@@ -15,10 +15,10 @@
     <rect x="116" y="56" width="122" height="94" rx="8" fill="#1F2A5E" opacity="0.9"/>
     <!-- 屏幕 -->
     <rect x="121" y="61" width="112" height="84" rx="5" fill="#1A1A2E"/>
-    <!-- HappyMac 像素脸：椭圆眼 ×2 + 微笑弧线 -->
-    <ellipse cx="152" cy="90" rx="8" ry="12" fill="#E8E4D8"/>
-    <ellipse cx="202" cy="90" rx="8" ry="12" fill="#E8E4D8"/>
-    <path d="M 156 116 Q 177 132 198 116" stroke="#E8E4D8" stroke-width="7" fill="none" stroke-linecap="round"/>
+    <!-- HappyMac 像素脸：开心 ^ ^ 眼 + 大微笑 -->
+    <path d="M 144 94 Q 152 84 160 94" stroke="#E8E4D8" stroke-width="6" fill="none" stroke-linecap="round"/>
+    <path d="M 194 94 Q 202 84 210 94" stroke="#E8E4D8" stroke-width="6" fill="none" stroke-linecap="round"/>
+    <path d="M 150 112 Q 177 138 204 112" stroke="#E8E4D8" stroke-width="8" fill="none" stroke-linecap="round"/>
     <!-- 软驱槽 -->
     <rect x="132" y="168" width="90" height="9" rx="3" fill="#1F2A5E" opacity="0.85"/>
     <!-- 下巴小字 -->
