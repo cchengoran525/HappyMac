@@ -1,4 +1,29 @@
-# HappyMac 🖥️
+<div align="center">
+  <img src="assets/happymac_banner.svg" width="800" alt="HappyMac — 一枚会陪你熬夜的赛博小生命"/>
+</div>
+
+<br>
+
+<div align="center">
+  <a href="firmware/happymac_v0/接线清单.md">接线清单</a> |
+  <a href="firmware/happymac_v0/元件尺寸台账.md">元件尺寸台账</a> |
+  <a href="firmware/happymac_v0/README.md">固件文档</a> |
+  <a href="simulator/happymac_sim.html">模拟器</a> |
+  <a href="firmware/power_test/power_test.ino">电源测试</a>
+</div>
+
+<br>
+
+<div align="center">
+  <img alt="固件" src="https://img.shields.io/badge/固件-v0.1-8A9A5B?style=flat-square">
+  <img alt="主控" src="https://img.shields.io/badge/主控-ESP32_C3-1F2A5E?style=flat-square">
+  <img alt="屏幕" src="https://img.shields.io/badge/屏幕-SH1106_1.3寸-1F2A5E?style=flat-square">
+  <img alt="雷达" src="https://img.shields.io/badge/双雷达-LD2450_LD2410C-4A7EBB?style=flat-square">
+  <img alt="哨兵" src="https://img.shields.io/badge/哨兵-SR602-4A7EBB?style=flat-square">
+  <img alt="深度睡眠" src="https://img.shields.io/badge/深度睡眠-µA级功耗-3A9D5D?style=flat-square">
+</div>
+
+<br>
 
 > 一个吸附在书桌背景板上的赛博小生命体。  
 > 它不是工具，它只是在陪着你。

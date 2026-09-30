@@ -1,0 +1,39 @@
+<svg width="860" height="260" viewBox="0 0 860 260" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="HappyMac">
+  <!-- 背景（麦金塔米白） -->
+  <rect width="860" height="260" fill="#FAF8F2"/>
+
+  <!-- 雷达波纹（左侧装饰， HappyMac 在感知你） -->
+  <path d="M 62 130 Q 78 114 62 98" stroke="#4A7EBB" stroke-width="4" fill="none" stroke-linecap="round" opacity="0.5"/>
+  <path d="M 44 140 Q 68 114 44 88" stroke="#4A7EBB" stroke-width="4" fill="none" stroke-linecap="round" opacity="0.32"/>
+  <path d="M 26 150 Q 60 114 26 78" stroke="#4A7EBB" stroke-width="4" fill="none" stroke-linecap="round" opacity="0.18"/>
+
+  <!-- 经典 Macintosh 128K -->
+  <g>
+    <!-- 机身（米色圆角） -->
+    <rect x="102" y="36" width="150" height="180" rx="14" fill="#D6CBB2" stroke="#1F2A5E" stroke-width="5"/>
+    <!-- 屏幕暗腔 -->
+    <rect x="116" y="56" width="122" height="94" rx="8" fill="#1F2A5E" opacity="0.9"/>
+    <!-- 屏幕 -->
+    <rect x="121" y="61" width="112" height="84" rx="5" fill="#1A1A2E"/>
+    <!-- HappyMac 像素脸：椭圆眼 ×2 + 微笑条 -->
+    <ellipse cx="152" cy="94" rx="8" ry="12" fill="#E8E4D8"/>
+    <ellipse cx="202" cy="94" rx="8" ry="12" fill="#E8E4D8"/>
+    <rect x="157" y="122" width="40" height="7" rx="3.5" fill="#E8E4D8"/>
+    <!-- 软驱槽 -->
+    <rect x="132" y="168" width="90" height="9" rx="3" fill="#1F2A5E" opacity="0.85"/>
+    <!-- 下巴小字 -->
+    <text x="177" y="200" font-family="Verdana, sans-serif" font-size="11" fill="#1F2A5E" text-anchor="middle" opacity="0.65">HappyMac</text>
+  </g>
+
+  <!-- 字标 -->
+  <text x="292" y="138" font-family="Verdana, 'PingFang SC', sans-serif" font-size="70" font-weight="bold" fill="#1F2A5E" letter-spacing="1">HappyMac</text>
+  <!-- 标语 -->
+  <text x="298" y="180" font-family="'PingFang SC', 'Microsoft YaHei', sans-serif" font-size="20" fill="#5A5A6E">它不是工具，它只是在陪着你。</text>
+
+  <!-- 小星星（右上装饰） -->
+  <g fill="#4A7EBB">
+    <path d="M 642 50 l 5.5 15 15 5.5 -15 5.5 -5.5 15 -5.5 -15 -15 -5.5 15 -5.5 z"/>
+    <circle cx="678" cy="40" r="4.5" opacity="0.7"/>
+    <circle cx="700" cy="72" r="3" opacity="0.45"/>
+  </g>
+</svg>
