@@ -15,6 +15,15 @@ HappyMac 是一枚桌面像素交互小宠物，形态为冰箱贴。它极度�
 
 ---
 
+## 当前版本：固件 v0.1
+
+- 像素脸表情系统：眉/眼/嘴形态化（挑眉、单眉好奇、wink、开心 ^、皱眉），特殊表情带冷却机制；
+- 四阶段深度省电：互动 → 睡眠（呼吸暗脸）→ 90s 断雷达红外独守 → 关屏 / 30min 深度睡眠（SR602 唤醒）；
+- 榫卯零螺丝外壳设计定稿：接线与元件尺寸见 [firmware/happymac_v0/](firmware/happymac_v0/)；
+- 模拟器与固件 1:1 同步（[simulator/happymac_sim.html](simulator/happymac_sim.html)）。
+
+---
+
 ## 硬件架构
 
 ```

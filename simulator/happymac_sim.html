@@ -143,7 +143,8 @@
         </div>
         <div class="row">
           <label class="sw"><input type="checkbox" id="swLegacy"> 旧版单帧判定</label>
-          <label class="sw"><input type="checkbox" id="swDebug" checked> OLED 调试层</label>
+          <label class="sw"><input type="checkbox" id="swDebug"> OLED 调试层</label>
+          <label class="sw"><input type="checkbox" id="swGlasses" checked> 半框眼镜</label>
         </div>
         <div class="row">
           <button id="btnCal">重校准 (!CAL)</button>
@@ -229,6 +230,14 @@ const FW = { /* 与固件 #define 一一对应 */
   V_NOISE_FLOOR: 8.0,      // v 特征噪声底：拆掉微动误入 LATERAL 的路
   SMILE_ENTER_MS: 600,      // ACTIVE 持续这么久才上笑容：短暂误进不闪嘴
   SMILE_MIN_MS: 1500,       // 笑容最短保持时间，防止嘴型反复横跳
+  HAPPY_EYES_MS: 800,       // 笑开始时 ^ 眼的持续时间，之后眼睛恢复睁开（嘴继续笑）
+  RADAR_OFF_AFTER_MS: 90000,   // SLEEP 后无人 90s → 断雷达电，只留红外待机
+  SCREEN_OFF_AFTER_MS: 120000, // 断雷达后再 2min 无人 → 屏幕全黑
+  RADAR_WARMUP_MS: 5000,       // 雷达上电预热（模拟器简化：不做预热门控）
+  WINK_COOLDOWN_MS: 45000,      // wink 最短间隔：特殊表情克制用
+  WINK_COOLDOWN_JITTER: 45000,  // 附加随机 0~45s → 实际 45~90s 一次
+  SMIRK_COOLDOWN_MS: 20000,     // 好奇歪嘴+单眉最短间隔
+  SMIRK_COOLDOWN_JITTER: 15000, // 附加随机 0~15s → 实际 20~35s 一次
   // ── 睡前过渡链（一次性事件动画：打哈欠→揉眼→渐暗→入睡，随时可被打断）──
   BEDTIME_YAWN_AT: 2500,    // 无人 2.5s 后开始链（在 GOODBYE 目送之后）
   BEDTIME_YAWN_MS: 2000,
@@ -301,11 +310,21 @@ function createSimCore() {
   let attention_offset = 0, attention_target = 0, attention_until = 0, next_attention_at = 7000, attention_sequence = 0;
   let nose_direction = -1;
   let blink_active = false, blink_started = 0, next_blink_at = 5200, blink_sequence = 0;
+  let blink_eye = 0, blink_count = 0;   // 每 4 次眨眼的最后一次为单眼 wink（左右交替）
+  let open_l = 13, open_r = 13, brow_y_l = 11, brow_y_r = 11;
+  let eye_mode_l = 0, eye_mode_r = 0;   // 0=长方形 1=开心^ 2=wink<
+  let happy_until = 0;                  // 笑开始时 ^ 眼的结束时间戳（0=未在笑）
+  let radar_powered = true, screen_off = false;   // 深度省电相位（与固件 updatePower 1:1）
+  let pir_in = false;                   // PIR 代理：拖拽人物 = 红外看到人
+  let last_wink_ms = 0, last_smirk_ms = 0;
+  let smirk_granted = false, smirk_side = 0, attention_prev_target = false;
+  let mouth_off = 0, mouth_short = false;
   let smile_until = 0;
   let eye_open = 12, sleepy = false, smiling = false, contrast = 170;
   let smile_pending_since = 0;
   let mouth_mode = "flat";
   let eye_wiggle = 0;
+  let brow_inner = 0;
   const EV = { NONE:0, YAWN:1, RUB:2, DIM:3 };
   let ev_cur = 0, ev_started = 0;
 
@@ -357,6 +376,14 @@ function createSimCore() {
   function setIR(v) { ir_present = v; }
 
   function sensorTick() { // 对应 readSensors() 的 2450 失联/衰减部分
+    if (!radar_powered) {   // 红外独守待机：雷达数据全失效（断电反灌也随固件高阻消失）
+      ingest2450Empty(); r10_pres = false; r10_em = 0; r10_es = 0;
+      if (motion_score > 0) {
+        motion_score--;
+        if (motion_stable && motion_score <= FW.MOTION_EXIT_SCORE) motion_stable = false;
+      }
+      return;
+    }
     if (r50.ok && t - r50.last > 500) r50.ok = false;
     if (!r50.ok && motion_score > 0) {
       motion_score--;
@@ -410,7 +437,8 @@ function createSimCore() {
     const extreme_part = Math.min(Math.max((magnitude - FW.LOOK_NORMAL_INPUT) /
       (FW.LOOK_EXTREME_INPUT - FW.LOOK_NORMAL_INPUT), 0), 1);
     const look_magnitude = normal_part * FW.LOOK_NORMAL_PX + extreme_part * (FW.LOOK_MAX_PX - FW.LOOK_NORMAL_PX);
-    model_a_direction = (delta < 0 ? 1 : -1) * look_magnitude;
+    // 方向约定与固件 1:1：delta<0 = 人在左手边（左移 X 减小）→ look 为负，眼睛朝左
+    model_a_direction = (delta < 0 ? -1 : 1) * look_magnitude;
     if (magnitude < FW.LOOK_DEADZONE_MM) model_a_direction = 0;
     else if (model_a_position === 0 && magnitude < FW.POSITION_EXIT_PX)
       model_a_direction *= magnitude / FW.POSITION_EXIT_PX;
@@ -545,8 +573,9 @@ function createSimCore() {
   // ── 动画层 ──
   function updateAnimation() {
     updateModelA();
-    if (model_a_position === 1) nose_direction = -1;
-    else if (model_a_position === 2) nose_direction = 1;
+    // 鼻子突出处朝人（2026-09-27 用户实测确认的约定；与眼睛通道解耦，单独翻转）
+    if (model_a_position === 1) nose_direction = 1;
+    else if (model_a_position === 2) nose_direction = -1;
     if (center_ok && !targetMoving() && state === HM.IDLE)
       center_x = center_x * 0.995 + flt.x * 0.005;
 
@@ -573,7 +602,14 @@ function createSimCore() {
     face_breath += (face_breath_target - face_breath) * 0.08;
 
     if (state === HM.SLEEP || ev_cur !== EV.NONE) { blink_active = false; next_blink_at = t + 1200; }
-    else if (!blink_active && t - next_blink_at >= 0) { blink_active = true; blink_started = t; }
+    else if (!blink_active && t - next_blink_at >= 0) {
+      blink_active = true; blink_started = t; blink_count++;
+      // 每 4 次眨眼的第 4 次尝试单眼 wink；受冷却克制（45~90s 内不重复）
+      if (blink_count % 4 === 0 && t - last_wink_ms >= FW.WINK_COOLDOWN_MS + Math.random() * FW.WINK_COOLDOWN_JITTER) {
+        blink_eye = 1 + blink_count % 2;
+        last_wink_ms = t;
+      } else blink_eye = 0;
+    }
     else if (blink_active && t - blink_started >= FW.BLINK_DURATION_MS) {
       blink_active = false;
       next_blink_at = t + 3800 + (blink_sequence++ % 5) * 550;
@@ -591,14 +627,6 @@ function createSimCore() {
       case HM.IDLE: eye_open = 11; break;
     }
     const ev_active = ev_cur !== EV.NONE;
-    if (blink_active && !ev_active) {
-      const el = t - blink_started;
-      let bs;
-      if (el < 55) bs = 1 - el/55;
-      else if (el < 105) bs = 0;
-      else bs = (el - 105) / 75;
-      eye_open = Math.trunc(eye_open * Math.min(Math.max(bs,0),1));
-    }
 
     if (state === HM.ACTIVE) {
       // 笑容有进入延迟：ACTIVE 持续足够久嘴才笑，短暂误进不闪嘴
@@ -627,7 +655,77 @@ function createSimCore() {
       eye_open = 1;
       mouth_mode = "flat";
     }
-    contrast = state === HM.SLEEP ? 35 + face_breath * 20 : 170;
+    if (state === HM.APPROACH && !ev_active) mouth_mode = "o";   // 凑近惊讶：小 o 嘴
+    if (blink_active && blink_eye !== 0) mouth_mode = "arc";     // wink：弧线笑（参考手绘稿）
+    if (mouth_mode === "smile") { if (happy_until === 0) happy_until = t + FW.HAPPY_EYES_MS; } else { happy_until = 0; }
+    // 好奇歪嘴+单眉的冷却：漂移开始（上升沿）时若冷却已过，发放本次表情令牌
+    const drift_start = attention_target !== 0 && !attention_prev_target;
+    attention_prev_target = attention_target !== 0;
+    if (drift_start) {
+      if (t - last_smirk_ms >= FW.SMIRK_COOLDOWN_MS + Math.random() * FW.SMIRK_COOLDOWN_JITTER) {
+        smirk_granted = true;
+        smirk_side = attention_target > 0 ? 1 : -1;
+        last_smirk_ms = t;
+      } else smirk_granted = false;
+    }
+    if (attention_target === 0) smirk_granted = false;
+    mouth_off = 0; mouth_short = false;
+    if (state === HM.IDLE && smirk_granted) {                    // 好奇：仅冷却通过的漂移次数
+      mouth_off = smirk_side * 4;
+      mouth_short = true;
+    }
+    // 眉毛表情层（与固件 drawFace 1:1，参考手绘稿）：惊讶=双眉高挑，好奇=单眉抬高，
+    // 皱眉=狐疑/目送；平静时随注意力漂移单眉轻挑 + 眨眼联动，让静止状态也"活着"。
+    brow_inner = 0;
+    let lift_l = 0, lift_r = 0;
+    switch (state) {
+      case HM.APPROACH: lift_l = 3; lift_r = 3; break;   // 突然看到的惊讶
+      case HM.ACTIVE: break;                             // 开心：眉平（眼睛已变 ^、嘴变 D）
+      case HM.RETREAT:
+      case HM.GOODBYE:  brow_inner = 1; break;           // 后退/目送：眉头微皱
+      case HM.WAKING:   lift_l = lift_r = Math.trunc(3 * Math.min(Math.max((t - state_since)/FW.WAKING_MS,0),1)); break;
+      case HM.SLEEP:    lift_l = lift_r = -1; break;     // 睡熟：眉放松下沉
+      case HM.IDLE: default:                             // 好奇：冷却通过的单次漂移才挑眉+歪嘴
+        if (smirk_granted) {
+          if (smirk_side > 0) { lift_r = 4; lift_l = 0; }
+          else { lift_l = 4; lift_r = 0; }
+        }
+        break;
+    }
+    // 眨眼/wink 按眼压高度（wink 只闭一只）；开心 ^ 眼在 drawEye 内画
+    open_l = eye_open; open_r = eye_open;
+    eye_mode_l = 0; eye_mode_r = 0;
+    if (blink_active && !ev_active) {
+      const el = t - blink_started;
+      let bs;
+      if (el < 55) bs = 1 - el/55;
+      else if (el < 105) bs = 0;
+      else bs = (el - 105) / 75;
+      const scaled = Math.trunc(eye_open * Math.min(Math.max(bs,0),1));
+      if (blink_eye === 0) { open_l = scaled; open_r = scaled; }
+      else if (blink_eye === 1) open_l = scaled;
+      else open_r = scaled;
+    }
+    if (mouth_mode === "smile" && !sleepy && t < happy_until) { eye_mode_l = 1; eye_mode_r = 1; }   // 笑开始短暂 ^ 眼
+    if (blink_active && blink_eye === 1) { eye_mode_l = 2; eye_mode_r = 0; }   // wink：另一眼保持睁开
+    else if (blink_active && blink_eye === 2) { eye_mode_r = 2; eye_mode_l = 0; }
+    if (blink_active && !ev_active) {
+      if (blink_eye === 1 && lift_l > 0) lift_l -= 1;
+      if (blink_eye === 2 && lift_r > 0) lift_r -= 1;
+    }
+    brow_y_l = 10 - lift_l + (blink_active && blink_eye === 1 ? 1 : 0);
+    brow_y_r = 10 - lift_r + (blink_active && blink_eye === 2 ? 1 : 0);
+    // 深度省电（与固件 updatePower 1:1）：睡眠 90s 断雷达 → 再 2min 关屏；拖拽人物 = PIR 唤醒
+    if (state === HM.SLEEP && !screen_off) {
+      if (radar_powered && t - state_since >= FW.RADAR_OFF_AFTER_MS) { radar_powered = false; log("PWR", "RADAR_OFF"); }
+      if (!radar_powered && t - state_since >= FW.RADAR_OFF_AFTER_MS + FW.SCREEN_OFF_AFTER_MS) { screen_off = true; log("PWR", "SCREEN_OFF"); }
+    }
+    if ((screen_off || !radar_powered) && pir_in) {
+      if (screen_off) { screen_off = false; log("PWR", "SCREEN_ON"); }
+      if (!radar_powered) { radar_powered = true; log("PWR", "RADAR_ON"); }
+    }
+    if (state !== HM.SLEEP) { radar_powered = true; screen_off = false; }
+    contrast = state === HM.SLEEP ? (radar_powered ? 12 + face_breath * 20 : 6) : 170;
     if (ev_cur === EV.DIM) {
       const p = Math.min((t - ev_started) / FW.BEDTIME_DIM_MS, 1);
       contrast = Math.round(170 - p * (170 - 45));
@@ -660,7 +758,9 @@ function createSimCore() {
     face_look = 0; face_look_target = 0; smile_until = 0; smiling = false;
     smile_pending_since = 0; mouth_mode = "flat"; eye_wiggle = 0;
     ev_cur = 0; ev_started = 0;
-    blink_active = false; next_blink_at = 5200; blink_sequence = 0;
+    blink_active = false; next_blink_at = 5200; blink_sequence = 0; blink_eye = 0; blink_count = 0;
+    last_wink_ms = 0; last_smirk_ms = 0; smirk_granted = false; attention_prev_target = false;
+    radar_powered = true; screen_off = false; pir_in = false;
     attention_offset = 0; attention_target = 0; next_attention_at = 7000;
   }
 
@@ -673,6 +773,11 @@ function createSimCore() {
     get motionScore(){return motion_score}, get motionStable(){return motion_stable},
     get yTrend(){return y_step_filtered}, get flt(){return flt}, get r50(){return r50},
     get faceLook(){return face_look}, get smiling(){return smiling},
+    get openL(){return open_l}, get openR(){return open_r},
+    get eyeModeL(){return eye_mode_l}, get eyeModeR(){return eye_mode_r},
+    get mouthOff(){return mouth_off}, get mouthShort(){return mouth_short},
+    get screenOff(){return screen_off}, set pir(v){ pir_in = v; },
+    get browYL(){return brow_y_l}, get browYR(){return brow_y_r}, get browInner(){return brow_inner},
     get mouthMode(){return mouth_mode}, get eyeWiggle(){return eye_wiggle},
     get ev(){return ev_cur}, get evName(){return EV_NAMES[ev_cur]},
     get eyeOpen(){return eye_open}, get sleepy(){return sleepy}, get contrast(){return contrast},
@@ -714,6 +819,7 @@ function createFB() {
     rbox(x,y,w,h){ this.box(x,y,w,h); if(w>2&&h>2){ // u8g2 r=1：去掉四角像素
       const c=[[x,y],[x+w-1,y],[x,y+h-1],[x+w-1,y+h-1]];
       for(const[cx,cy]of c) fb[cy*128+cx]=0; } },
+    rframe(x,y,w,h){ this.rbox(x,y,w,h); for(let j=1;j<h-1;j++) for(let i=1;i<w-1;i++) fb[(y+j)*128+x+i]=0; },
     line(x0,y0,x1,y1){ const dx=Math.abs(x1-x0),dy=Math.abs(y1-y0),sx=x0<x1?1:-1,sy=y0<y1?1:-1;
       let err=dx-dy; for(;;){ this.px(x0,y0); if(x0===x1&&y0===y1)break;
       const e2=2*err; if(e2>-dy){err-=dy;x0+=sx;} if(e2<dx){err+=dx;y0+=sy;} } },
@@ -728,7 +834,8 @@ function createFB() {
   };
 }
 
-function renderFace(fb, core, debugOverlay) {
+function renderFace(fb, core, debugOverlay, glasses) {
+  if (core.screenOff) { fb.clear(); return; }   // 全黑（固件 setPowerSave(1)）
   fb.clear();
   const t = core.t, look = core.faceLook;
   if (debugOverlay) {
@@ -743,26 +850,78 @@ function renderFace(fb, core, debugOverlay) {
   const nose_x = Math.trunc(64 + look + 7*ratio);
   const mouth_x = Math.trunc(64 + look + 4*ratio);
   const eye_y = 23 + (core.eyeWiggle || 0);
-  drawEye(fb, left_eye_x, eye_y, core.eyeOpen, core.sleepy);
-  drawEye(fb, right_eye_x, eye_y, core.eyeOpen, core.sleepy);
-  fb.box(nose_x-1, 26, 3, 13);
-  if (core.noseDirection < 0) fb.box(nose_x-7, 37, 8, 3);
-  else fb.box(nose_x, 37, 8, 3);
-  drawMouth(fb, mouth_x, core.mouthMode);
+  drawEye(fb, left_eye_x, eye_y, core.openL, core.sleepy, core.eyeModeL);
+  drawEye(fb, right_eye_x, eye_y, core.openR, core.sleepy, core.eyeModeR);
+  // 小 J 鼻（参考手绘稿）：短竖 + 底部突出小脚，突出处朝人（noseDirection 已实测确认）。
+  fb.box(nose_x-1, 32, 3, 6);
+  if (core.noseDirection < 0) fb.box(nose_x-4, 37, 5, 2);
+  else fb.box(nose_x, 37, 5, 2);
+  drawMouth(fb, mouth_x + (core.mouthOff || 0), core.mouthMode, core.mouthShort);
+  if (glasses) drawGlasses(fb, left_eye_x, right_eye_x, eye_y);
+  drawBrow(fb, left_eye_x, core.browYL, core.browInner, 1);
+  drawBrow(fb, right_eye_x, core.browYR, core.browInner, -1);
 }
-function drawEye(fb, cx, cy, open, sleepy) {
+function drawBrow(fb, cx, y0, inner, dir) {
+  // 眉毛：宀 形粗眉（参考手绘稿）——3px 厚、19px 宽横杠 + 两端下腿；inner=1 内腿加长（皱眉）
+  fb.box(cx-9, y0, 19, 3);
+  fb.box(cx-9, y0+3, 2, 3 + (dir < 0 ? inner : 0));
+  fb.box(cx+7, y0+3, 2, 3 + (dir > 0 ? inner : 0));
+}
+function drawGlasses(fb, lcx, rcx, cy) {
+  // U 形杯眼镜（参考手绘稿）：29×2 粗底杠 + 两侧 2px 腿上延 10px + 小拱形桥连接两杯内腿
+  const HW = 14, LEG = 10, y0 = cy + 8;
+  for (const cx of [lcx, rcx]) {
+    fb.box(cx-HW, y0, HW*2+1, 2);    // 底杠（2px 粗）
+    fb.box(cx-HW, y0-LEG, 2, LEG);   // 左腿
+    fb.box(cx+HW-1, y0-LEG, 2, LEG); // 右腿
+  }
+  const x0 = lcx + HW - 1, x1 = rcx - HW + 1;
+  if (x1 > x0) {
+    const half = (x1 - x0) / 2, mid = (x0 + x1) / 2, end = y0 - LEG;
+    for (let x = x0; x <= x1; x++) {
+      const k = Math.min(1, Math.abs(x - mid) / half);
+      fb.px(x, end - Math.round(3 * Math.sqrt(1 - k * k)));
+    }
+  }
+}
+function drawEye(fb, cx, cy, open, sleepy, mode) {
+  // mode 0=完整长方形 1=开心 ^（2px 粗房顶形） 2=wink <（2px 粗）
+  if (mode === 2) {  // wink <：更大更粗（9×9，3px 笔画）
+    for (let i = 0; i < 3; i++) {
+      fb.line(cx+4-i, cy-4, cx-2-i, cy);
+      fb.line(cx-2-i, cy, cx+4-i, cy+4);
+    }
+    return;
+  }
   if (sleepy || open <= 1) { fb.box(cx-4, cy, 8, 2); return; }
   const h = Math.min(Math.max(open,2), FW.EYE_MAX_HEIGHT_PX);
+  if (mode === 1) { // 开心 ^：加大到 11px 宽、2px 粗，弧度可读
+    for (let i = 0; i < 2; i++) {
+      fb.line(cx-5, cy-1+i, cx, cy-3+i);
+      fb.line(cx, cy-3+i, cx+5, cy-1+i);
+    }
+    return;
+  }
   fb.rbox(cx-4, cy - Math.floor(h/2), 8, h);
 }
-function drawMouth(fb, cx, mode) {
-  if (mode === "yawn") { fb.rbox(cx-6, 44, 12, 11); return; }  // 打哈欠的大 O
-  if (mode !== "smile") { fb.box(cx-14, 51, 28, 3); return; }
-  fb.rbox(cx-22, 46, 5, 5);
-  fb.rbox(cx+17, 46, 5, 5);
-  fb.box(cx-16, 51, 32, 4);
-  fb.line(cx-17, 50, cx-16, 51);
-  fb.line(cx+16, 51, cx+17, 50);
+function drawMouth(fb, cx, mode, short_mouth) {
+  if (mode === "yawn") { fb.rbox(cx-6, 44, 12, 11); return; }   // 打哈欠的大 O（实心）
+  if (mode === "o") { fb.rbox(cx-5, 45, 11, 10); return; }      // 惊讶方嘴：上下加高更明显（参考手绘稿）
+  if (mode === "arc") {                                         // wink：用经典笑（宽条+两端小方角）
+    fb.rbox(cx-22, 46, 5, 5);
+    fb.rbox(cx+17, 46, 5, 5);
+    fb.box(cx-16, 51, 32, 4);
+    fb.line(cx-17, 50, cx-16, 51);
+    fb.line(cx+16, 51, cx+17, 50);
+    return;
+  }
+  if (mode !== "smile") {                                       // 平嘴（好奇）：歪嘴怀疑时更短
+    if (short_mouth) { fb.box(cx-5, 50, 11, 3); return; }
+    fb.box(cx-8, 50, 17, 3);
+    return;
+  }
+  fb.box(cx-10, 46, 21, 3);                                     // 开心 D 形嘴：平顶段
+  fb.rbox(cx-10, 46, 21, 8);                                    // + 圆角主体（上下加高、底圆如 D）
 }
 
 /* ============================================================
@@ -1063,6 +1222,7 @@ if (typeof window !== "undefined" && typeof document !== "undefined") (function(
       } else {
         radar.tick(dt, swNoise.checked, radar.person);
       }
+      core.pir = dragging;   // 拖拽人物 = 红外看到人（断雷达时的唤醒代理）
       core.step(dt);
     }
 
@@ -1070,11 +1230,11 @@ if (typeof window !== "undefined" && typeof document !== "undefined") (function(
     display_acc += dt;
     if (display_acc >= FW.DISPLAY_MS || trailDrawDirty) {
       display_acc = 0; trailDrawDirty = false;
-      renderFace(fb, core, swDebug.checked);
+      renderFace(fb, core, swDebug.checked, swGlasses.checked);
       const img = octx.createImageData(128,64);
       const lum = Math.max(0.16, Math.min(1, core.contrast/170));
       for (let i=0;i<128*64;i++) {
-        const v = fb.fb[i] ? Math.round(232*lum) : 8;
+        const v = fb.fb[i] ? Math.round(232*lum) : (core.screenOff ? 0 : 8);
         img.data[i*4]=v; img.data[i*4+1]=v; img.data[i*4+2]=v; img.data[i*4+3]=255;
       }
       octx.putImageData(img,0,0);

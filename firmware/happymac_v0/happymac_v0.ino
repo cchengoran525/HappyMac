@@ -23,6 +23,9 @@
 #include "USBCDC.h"
 #endif
 #include <Wire.h>
+#include <Preferences.h>
+#include <esp_sleep.h>
+#include "driver/gpio.h"
 #include <U8g2lib.h>
 #include <ld2410.h>
 #include <HardwareSerial.h>
@@ -37,6 +40,7 @@
 #define PIN_2450_RX   20
 #define PIN_2450_TX   21
 #define RADAR_BAUD    256000
+#define FW_VERSION    "0.1"    // 固件版本（启动日志与发布标签）
 
 #define EMA_A         0.55f
 #define DISPLAY_MS    80       // 约 12.5Hz；与采集固件一致，给 100kHz I²C 留余量
@@ -81,6 +85,16 @@
 #define MOTION_EXIT_SCORE  1       // 持续安静后才退出“在动”
 #define SMILE_ENTER_MS    600      // ACTIVE 持续这么久嘴才笑：短暂误进不闪嘴
 #define SMILE_MIN_MS      1500     // 笑容最短保持时间，防止嘴型反复横跳
+#define HAPPY_EYES_MS     800      // 笑开始时 ^ 眼的持续时间，之后眼睛恢复睁开（嘴继续笑）
+#define WINK_COOLDOWN_MS      45000  // wink 最短间隔：特殊表情克制用
+#define WINK_COOLDOWN_JITTER  45000  // 附加随机 0~45s → 实际 45~90s 一次
+#define SMIRK_COOLDOWN_MS     20000  // 好奇歪嘴+单眉最短间隔
+#define SMIRK_COOLDOWN_JITTER 15000  // 附加随机 0~15s → 实际 20~35s 一次
+#define PIN_RADAR_PWR        1       // 雷达电源开关（GPIO1，高=上电，经 F5305S 高边模块）
+#define RADAR_OFF_AFTER_MS   90000   // SLEEP 后无人 90s → 断雷达电，只留红外待机
+#define SCREEN_OFF_AFTER_MS  120000  // 断雷达后再 2min 无人 → 屏幕全黑（SH1106 显示关闭）
+#define RADAR_WARMUP_MS      5000    // 雷达上电预热：期间数据不可信，只信红外
+#define DEEP_SLEEP_AFTER_MS  1800000 // 关屏后再 30min 无人 → 深度睡眠（PIR 唤醒=重启）
 #define BEDTIME_YAWN_AT   2500     // 无人 2.5s 后开始睡前链（在 GOODBYE 目送之后）
 #define BEDTIME_YAWN_MS   2000
 #define BEDTIME_RUB_MS    1500
@@ -92,6 +106,7 @@ HardwareSerial radar2450(0);
 
 // ─── LD2450 ──────────────────────────────────────────
 int16_t r50_x = 0, r50_y = 0, r50_v = 0;
+bool x_invert = true;  // 当前安装朝向下 raw x 与"偏左为负"约定相反，parse 时取反；重装雷达后若方向再反，串口 !FLIP 切换
 bool r50_ok = false;
 uint32_t r50_last = 0;
 float flt_x = 0, flt_y = 0;
@@ -162,7 +177,7 @@ uint32_t last_state_log = 0;
 bool had_target = false;
 bool stable_presence = false;
 uint32_t presence_candidate_since = 0;
-bool debug_overlay = true;
+bool debug_overlay = false;   // 默认只显示表情；串口发 !DEBUG 可临时打开 S:/A: 文字层
 int oled_contrast = -1;
 uint32_t last_contrast_update = 0;
 uint32_t last_diag_log = 0;
@@ -196,6 +211,18 @@ bool blink_active = false;
 uint32_t blink_started = 0;
 uint32_t next_blink_at = 5200;
 uint8_t blink_sequence = 0;
+uint8_t blink_count = 0;   // 眨眼计数：每 4 次的最后一次为单眼 wink（左右交替）
+uint8_t blink_eye = 0;     // 0=双眼 1=左眼 2=右眼
+uint32_t happy_until = 0;  // 笑开始时 ^ 眼的结束时间戳（0=未在笑）
+uint32_t last_wink_ms = 0;    // 上次 wink 时刻（冷却用）
+uint32_t last_smirk_ms = 0;   // 上次好奇歪嘴+单眉时刻（冷却用）
+bool smirk_granted = false;   // 本次注意力漂移是否获准播放歪嘴+挑眉
+int8_t smirk_side = 0;        // 漂移/歪嘴侧：1=右 -1=左
+bool attention_prev_target = false;  // 上一帧 attention_target 非零？（漂移上升沿检测）
+bool radar_powered = true;    // 雷达供电状态（F5305S 高边开关）
+bool screen_off = false;      // 屏幕全黑（SH1106 setPowerSave(1)）
+uint32_t radar_on_at = 0;     // 雷达上电时刻（预热计时）
+uint32_t screen_off_at = 0;   // 屏幕全黑时刻（深度睡眠计时）
 uint32_t smile_until = 0;
 uint32_t smile_pending_since = 0;
 
@@ -282,7 +309,7 @@ void parse2450() {
           int y = (ry & 0x8000) ? (ry & 0x7FFF) : -(ry & 0x7FFF);
           int v = (rv & 0x8000) ? (rv & 0x7FFF) : -(rv & 0x7FFF);
           if (!(x == 0 && y == 0)) {
-            r50_x = x; r50_y = y; r50_v = v; r50_ok = true;
+            r50_x = x_invert ? -x : x; r50_y = y; r50_v = v; r50_ok = true;
             if (!filter_ok) {
               flt_x = x; flt_y = y; prev_y = y;
               flt_v = v;
@@ -311,7 +338,73 @@ void parse2450() {
   }
 }
 
+// ── 深度省电：红外独守 → 断雷达 → 关屏 ──────────────────
+void radarPowerOff() {
+  digitalWrite(PIN_RADAR_PWR, LOW);        // 断两雷达 VCC
+  radar_powered = false;
+  pinMode(PIN_2450_TX, INPUT);             // 串口输出脚设高阻，防 3.3V 反灌断电侧
+  pinMode(PIN_2410_TX, INPUT);
+  r50_ok = false; r10_pres = false; r10_em = 0; r10_es = 0;
+  if (Serial && Serial.availableForWrite() > 32) Serial.println("POWER,RADAR_OFF");
+}
+
+void radarPowerOn() {
+  pinMode(PIN_2450_TX, OUTPUT);            // 恢复串口脚
+  pinMode(PIN_2410_TX, OUTPUT);
+  digitalWrite(PIN_RADAR_PWR, HIGH);       // 上电
+  radar_powered = true;
+  radar_on_at = millis();
+  center_ok = false;                       // 断电后滤波数据不可信，重新校准中心
+  radar2410.begin(Serial1);                // 2410 重新初始化握手
+  if (Serial && Serial.availableForWrite() > 32) Serial.println("POWER,RADAR_ON");
+}
+
+void updatePower() {
+  uint32_t now = millis();
+
+  // 睡眠两段深度省电：90s 无人断雷达 → 再 2min 关屏幕
+  if (state == HM_SLEEP && !screen_off) {
+    if (radar_powered && now - state_since >= RADAR_OFF_AFTER_MS) radarPowerOff();
+    if (!radar_powered && now - state_since >= RADAR_OFF_AFTER_MS + SCREEN_OFF_AFTER_MS) {
+      oled.setPowerSave(1);                // SH1106 显示关闭：全黑、~0.1mA
+      screen_off = true;
+      screen_off_at = now;
+      if (Serial && Serial.availableForWrite() > 32) Serial.println("POWER,SCREEN_OFF");
+    }
+  }
+
+  // 第四阶段：关屏 30min 仍无人 → 深度睡眠（PIR GPIO5 高电平唤醒=重启，setup 全新初始化）
+  if (screen_off && now - screen_off_at >= DEEP_SLEEP_AFTER_MS) {
+    if (Serial && Serial.availableForWrite() > 32) Serial.println("POWER,DEEP_SLEEP");
+    Serial.flush();
+    digitalWrite(PIN_RADAR_PWR, LOW);      // 雷达保持断电
+    gpio_hold_en(GPIO_NUM_1);              // 深睡期间锁存低电平（防栅极悬空被信号线反灌）
+    gpio_deep_sleep_hold_en();
+    esp_deep_sleep_enable_gpio_wakeup(1ULL << 5, ESP_GPIO_WAKEUP_GPIO_HIGH);   // C3 专用 API：PIR(GPIO5) 高电平唤醒（唤醒=重启）
+    esp_deep_sleep_start();                // 不返回；唤醒后从 setup() 重新开始
+  }
+
+  // 唤醒：红外发现人 → 屏幕先亮，雷达上电预热（数据预热期后可信）
+  if ((screen_off || !radar_powered) && ir_present) {
+    if (screen_off) {
+      oled.setPowerSave(0);
+      screen_off = false;
+      if (Serial && Serial.availableForWrite() > 32) Serial.println("POWER,SCREEN_ON");
+    }
+    if (!radar_powered) radarPowerOn();
+  }
+}
+
 void readSensors() {
+  ir_present = digitalRead(PIN_IR) == HIGH;
+  if (!radar_powered) {                    // 红外独守待机：两雷达断电，数据全失效
+    r50_ok = false; r10_pres = false; r10_em = 0; r10_es = 0;
+    if (!r50_ok && motion_score > 0) {
+      motion_score--;
+      if (motion_stable && motion_score <= MOTION_EXIT_SCORE) motion_stable = false;
+    }
+    return;
+  }
   radar2410.read();
   r10_pres = radar2410.movingTargetDetected() ||
              radar2410.stationaryTargetDetected();
@@ -321,6 +414,9 @@ void readSensors() {
 
   parse2450();
   if (r50_ok && millis() - r50_last > 500) r50_ok = false;
+  if (radar_powered && millis() - radar_on_at < RADAR_WARMUP_MS) {  // 上电预热：数据不可信，只信红外
+    r50_ok = false; r10_pres = false;
+  }
   // 雷达失联时让运动证据自然衰减，避免运动状态挂在过期数据上。
   if (!r50_ok && motion_score > 0) {
     motion_score--;
@@ -404,7 +500,8 @@ void updateModelA() {
       (LOOK_EXTREME_INPUT - LOOK_NORMAL_INPUT), 0.0f, 1.0f);
   float look_magnitude = normal_part * LOOK_NORMAL_PX +
                          extreme_part * (LOOK_MAX_PX - LOOK_NORMAL_PX);
-  model_a_direction = (delta < 0.0f ? 1.0f : -1.0f) * look_magnitude;
+  // 方向约定（parse 取反后成立）：r50_x 偏左为负 → delta<0 = 人在左手边 → look 为负，眼睛/鼻子朝左。
+  model_a_direction = (delta < 0.0f ? -1.0f : 1.0f) * look_magnitude;
   if (fabsf(delta) < LOOK_DEADZONE_MM) {
     model_a_direction = 0.0f;
   } else if (model_a_position == POS_CENTER && fabsf(delta) < POSITION_EXIT_PX) {
@@ -626,8 +723,9 @@ void updateAnimation() {
   updateModelA();
 
   // 保留鼻子的左右方向性，但只切换底部横线，不翻转竖线。
-  if (model_a_position == POS_LEFT) nose_direction = -1;
-  else if (model_a_position == POS_RIGHT) nose_direction = 1;
+  // 鼻子突出处朝人（2026-09-27 用户实测确认的约定；与眼睛通道解耦，单独翻转）
+  if (model_a_position == POS_LEFT) nose_direction = 1;
+  else if (model_a_position == POS_RIGHT) nose_direction = -1;
 
   // 启动后以当前目标位置为中心，缓慢吸收 LD2450 的长期漂移。
   if (center_ok && !targetMoving() && state == HM_IDLE) {
@@ -657,6 +755,20 @@ void updateAnimation() {
   }
   attention_offset += (attention_target - attention_offset) * 0.05f;
 
+  // 好奇歪嘴+单眉的冷却：漂移开始（上升沿）时若冷却已过，发放本次表情令牌
+  bool drift_start = attention_target != 0 && !attention_prev_target;
+  attention_prev_target = attention_target != 0;
+  if (drift_start) {
+    if (now - last_smirk_ms >= SMIRK_COOLDOWN_MS + random(0, SMIRK_COOLDOWN_JITTER)) {
+      smirk_granted = true;
+      smirk_side = attention_target > 0 ? 1 : -1;
+      last_smirk_ms = now;
+    } else {
+      smirk_granted = false;
+    }
+  }
+  if (attention_target == 0) smirk_granted = false;
+
   // 先平滑目标，再以限速方式移动整张脸，避免“到点式”跳转。
   float desired_look = constrain(model_a_direction + attention_offset,
                                  -LOOK_MAX_PX, LOOK_MAX_PX);
@@ -673,46 +785,104 @@ void updateAnimation() {
   } else if (!blink_active && (int32_t)(now - next_blink_at) >= 0) {
     blink_active = true;
     blink_started = now;
+    blink_count++;
+    // 每 4 次眨眼的第 4 次尝试单眼 wink；受冷却克制（45~90s 内不重复）
+    if (blink_count % 4 == 0 && now - last_wink_ms >= WINK_COOLDOWN_MS + random(0, WINK_COOLDOWN_JITTER)) {
+      blink_eye = (uint8_t)(1 + blink_count % 2);
+      last_wink_ms = now;
+    } else {
+      blink_eye = 0;
+    }
   } else if (blink_active && now - blink_started >= BLINK_DURATION_MS) {
     blink_active = false;
     next_blink_at = now + 3800 + (blink_sequence++ % 5) * 550;
   }
 }
 
-void drawEye(int cx, int cy, int open, bool sleepy) {
-  // 麦金塔经典笑脸：眼睛宽度固定，只改变高度，不画瞳孔。
+void drawEye(int cx, int cy, int open, bool sleepy, int mode) {
+  // mode 0=完整长方形 1=开心 ^（2px 粗房顶形） 2=wink <（2px 粗）
+  if (mode == 2) {  // wink <：更大更粗（9×9，3px 笔画）
+    for (int i = 0; i < 3; i++) {
+      oled.drawLine(cx + 4 - i, cy - 4, cx - 2 - i, cy);
+      oled.drawLine(cx - 2 - i, cy, cx + 4 - i, cy + 4);
+    }
+    return;
+  }
   if (sleepy || open <= 1) {
     oled.drawBox(cx - EYE_WIDTH_PX / 2, cy, EYE_WIDTH_PX, 2);
     return;
   }
   int h = constrain(open, 2, EYE_MAX_HEIGHT_PX);
+  if (mode == 1) {  // 开心 ^：加大到 11px 宽、2px 粗，弧度可读
+    for (int i = 0; i < 2; i++) {
+      oled.drawLine(cx - 5, cy - 1 + i, cx, cy - 3 + i);
+      oled.drawLine(cx, cy - 3 + i, cx + 5, cy - 1 + i);
+    }
+    return;
+  }
   oled.drawRBox(cx - EYE_WIDTH_PX / 2, cy - h / 2,
                EYE_WIDTH_PX, h, 1);
 }
 
-void drawMouth(int cx, int mode) {
-  if (mode == 2) {
-    // 打哈欠的大 O 嘴。
+void drawMouth(int cx, int mode, bool short_mouth) {
+  if (mode == 2) {                                  // 打哈欠的大 O 嘴（实心）
     oled.drawRBox(cx - 6, 44, 12, 11, 2);
     return;
   }
-  if (mode != 1) {
-    // 平嘴：厚度保持和微笑嘴主体接近。
-    oled.drawBox(cx - 14, 51, 28, 3);
+  if (mode == 3) {                                  // 惊讶方嘴：上下加高更明显（参考手绘稿）
+    oled.drawRBox(cx - 5, 45, 11, 10, 2);
     return;
   }
+  if (mode == 4) {                                  // wink：用经典笑（宽条+两端小方角）
+    oled.drawRBox(cx - 22, 46, 5, 5, 1);
+    oled.drawRBox(cx + 17, 46, 5, 5, 1);
+    oled.drawBox(cx - 16, 51, 32, 4);
+    oled.drawLine(cx - 17, 50, cx - 16, 51);
+    oled.drawLine(cx + 16, 51, cx + 17, 50);
+    return;
+  }
+  if (mode != 1) {                                  // 平嘴（好奇）：短粗杠 / 歪嘴怀疑时更短
+    if (short_mouth) { oled.drawBox(cx - 5, 50, 11, 3); return; }
+    oled.drawBox(cx - 8, 50, 17, 3);
+    return;
+  }
+  oled.drawBox(cx - 10, 46, 21, 3);                 // 开心 D 形嘴：平顶段
+  oled.drawRBox(cx - 10, 46, 21, 8, 3);             // + 圆角主体（上下加高、底圆如 D）
+}
 
-  // 参考图的微笑嘴：整体要宽，两个小方角只是两端，不是主体。
-  // 横带约 32 px，整体宽约 44 px，接近截图中的比例。
-  oled.drawRBox(cx - 22, 46, 5, 5, 1);
-  oled.drawRBox(cx + 17, 46, 5, 5, 1);
-  oled.drawBox(cx - 16, 51, 32, 4);
-  oled.drawLine(cx - 17, 50, cx - 16, 51);
-  oled.drawLine(cx + 16, 51, cx + 17, 50);
+// 眉毛：宀 形粗眉（参考手绘稿）——3px 厚、19px 宽横杠 + 两端下腿；inner=1 内腿加长（皱眉）。
+// y0 顶行（越小越抬）；dir=+1 左眉（内腿靠鼻侧），-1 右眉。
+void drawBrow(int cx, int y0, int inner, int dir) {
+  oled.drawBox(cx - 9, y0, 19, 3);                              // 3px 厚横杠 19 宽
+  oled.drawBox(cx - 9, y0 + 3, 2, 3 + (dir < 0 ? inner : 0));   // 外/内腿
+  oled.drawBox(cx + 7, y0 + 3, 2, 3 + (dir > 0 ? inner : 0));
+}
+
+// U 形杯眼镜（参考手绘稿）：29×2 粗底杠 + 两侧 2px 腿上延 10px + 小拱形桥连接两杯内腿。
+void drawGlasses(int lcx, int rcx, int cy) {
+  const int HW = 14, LEG = 10, y0 = cy + 8;
+  for (int i = 0; i < 2; i++) {
+    int cx = i ? rcx : lcx;
+    oled.drawBox(cx - HW, y0, HW * 2 + 1, 2);      // 底杠（2px 粗）
+    oled.drawBox(cx - HW, y0 - LEG, 2, LEG);       // 左腿
+    oled.drawBox(cx + HW - 1, y0 - LEG, 2, LEG);   // 右腿
+  }
+  int x0 = lcx + HW - 1, x1 = rcx - HW + 1;        // 小拱形桥：连接两杯内腿顶
+  if (x1 > x0) {
+    float half = (x1 - x0) / 2.0f, mid = (x0 + x1) / 2.0f;
+    int end = y0 - LEG;
+    for (int x = x0; x <= x1; x++) {
+      float k = fabsf((x - mid) / half);
+      if (k > 1.0f) k = 1.0f;
+      int r = end - (int)(3.0f * sqrtf(1.0f - k * k) + 0.5f);
+      oled.drawPixel(x, r);
+    }
+  }
 }
 
 void drawFace() {
   uint32_t now = millis();
+  if (screen_off) return;   // 屏幕全黑：跳过绘制与发送，唤醒后 setPowerSave(0) 恢复
   oled.clearBuffer();
 
   if (debug_overlay) {
@@ -764,13 +934,35 @@ void drawFace() {
       break;
   }
 
-  if (blink_active && ev_cur == EV_NONE) {
-    uint32_t elapsed = now - blink_started;
-    float blink_scale;
-    if (elapsed < 55) blink_scale = 1.0f - elapsed / 55.0f;
-    else if (elapsed < 105) blink_scale = 0.0f;
-    else blink_scale = (elapsed - 105) / 75.0f;
-    eye_open = (int)(eye_open * constrain(blink_scale, 0.0f, 1.0f));
+  // 不是所有状态都笑：ACTIVE 使用参考图的微笑嘴，其余状态多数为平嘴。
+  // 笑容有进入延迟（短暂误进 ACTIVE 不闪嘴）和最短保持时间（状态边界
+  // 来回抖时嘴型停留足够久才收）；睡眠/目送/醒来属于表情转折，不保留笑容。
+  // 嘴型先算：笑眼（squint）依赖它。
+  if (state == HM_ACTIVE) {
+    if (smile_pending_since == 0) smile_pending_since = now;
+    mouth_mode = now - smile_pending_since >= SMILE_ENTER_MS ? 1 : 0;
+    if (mouth_mode == 1) smile_until = now + SMILE_MIN_MS;
+  } else {
+    smile_pending_since = 0;
+    // 保持期内的笑容继续显示；SLEEP/GOODBYE/WAKING 属表情转折，立即收起。
+    mouth_mode = (state == HM_IDLE || state == HM_APPROACH || state == HM_RETREAT) &&
+                 (int32_t)(now - smile_until) < 0 ? 1 : 0;
+  }
+  if (ev_cur == EV_YAWN) mouth_mode = 2;   // 打哈欠的大 O 嘴
+
+  if (mouth_mode == 1) {
+    if (happy_until == 0) happy_until = now + HAPPY_EYES_MS;   // 笑开始：短暂 ^ 眼窗口
+  } else {
+    happy_until = 0;                                           // 笑收起即清零，下次笑重新触发
+  }
+  if (state == HM_APPROACH && ev_cur == EV_NONE) mouth_mode = 3;   // 凑近惊讶：小 o 嘴（参考手绘稿）
+  if (blink_active && blink_eye != 0) mouth_mode = 4;              // wink：弧线笑（参考手绘稿）
+  // 好奇（单眉挑）：嘴同向往漂移侧偏移并缩短（怀疑的歪嘴），仅冷却通过的漂移次数
+  int mouth_off = 0;
+  bool mouth_short = false;
+  if (state == HM_IDLE && smirk_granted) {
+    mouth_off = smirk_side * 4;
+    mouth_short = true;
   }
 
   // 一次性事件动画：帧内覆盖表情，播完回姿态层
@@ -786,32 +978,67 @@ void drawFace() {
   } else if (ev_cur == EV_DIM) {
     eye_open = 1;
   }
-  drawEye(left_eye_x, eye_y, eye_open, sleepy);
-  drawEye(right_eye_x, eye_y, eye_open, sleepy);
 
-  // 固定的 J 形鼻子，和整张脸一起平移。
-  oled.drawBox(nose_x - 1, 26, 3, 13);
-  if (nose_direction < 0) oled.drawBox(nose_x - 7, 37, 8, 3);
-  else oled.drawBox(nose_x, 37, 8, 3);
-
-  // 不是所有状态都笑：ACTIVE 使用参考图的微笑嘴，其余状态多数为平嘴。
-  // 笑容有进入延迟（短暂误进 ACTIVE 不闪嘴）和最短保持时间（状态边界
-  // 来回抖时嘴型停留足够久才收）；睡眠/目送/醒来属于表情转折，不保留笑容。
-  if (state == HM_ACTIVE) {
-    if (smile_pending_since == 0) smile_pending_since = now;
-    mouth_mode = now - smile_pending_since >= SMILE_ENTER_MS ? 1 : 0;
-    if (mouth_mode == 1) smile_until = now + SMILE_MIN_MS;
-  } else {
-    smile_pending_since = 0;
-    // 保持期内的笑容继续显示；SLEEP/GOODBYE/WAKING 属表情转折，立即收起。
-    mouth_mode = (state == HM_IDLE || state == HM_APPROACH || state == HM_RETREAT) &&
-                 (int32_t)(now - smile_until) < 0 ? 1 : 0;
+  // 眨眼/wink：每 4 次眨眼的最后一次为单眼 wink（左右交替），双眨按比例压高度
+  int open_l = eye_open, open_r = eye_open;
+  if (blink_active && ev_cur == EV_NONE) {
+    uint32_t elapsed = now - blink_started;
+    float blink_scale;
+    if (elapsed < 55) blink_scale = 1.0f - elapsed / 55.0f;
+    else if (elapsed < 105) blink_scale = 0.0f;
+    else blink_scale = (elapsed - 105) / 75.0f;
+    int scaled = (int)(eye_open * constrain(blink_scale, 0.0f, 1.0f));
+    if (blink_eye == 0) { open_l = scaled; open_r = scaled; }
+    else if (blink_eye == 1) open_l = scaled;
+    else open_r = scaled;
   }
-  if (ev_cur == EV_YAWN) mouth_mode = 2;   // 打哈欠的大 O 嘴
-  drawMouth(mouth_x, mouth_mode);
+  int eye_mode_l = 0, eye_mode_r = 0;
+  if (mouth_mode == 1 && !sleepy && now < happy_until) { eye_mode_l = 1; eye_mode_r = 1; }   // 笑开始短暂 ^ 眼
+  if (blink_active && blink_eye == 1) { eye_mode_l = 2; eye_mode_r = 0; }  // wink：左眼挤 <，右眼保持睁开
+  else if (blink_active && blink_eye == 2) { eye_mode_r = 2; eye_mode_l = 0; }
+  drawEye(left_eye_x, eye_y, open_l, sleepy, eye_mode_l);
+  drawEye(right_eye_x, eye_y, open_r, sleepy, eye_mode_r);
 
-  // 睡眠呼吸：亮度保持很低，但不完全熄灭；渐暗事件期间做斜坡。
-  int contrast = state == HM_SLEEP ? 35 + (int)(face_breath * 20) : 170;
+  // 小 J 鼻（参考手绘稿）：短竖 + 底部突出小脚，突出处朝人（nose_direction 已实测确认）。
+  oled.drawBox(nose_x - 1, 32, 3, 6);
+  if (nose_direction < 0) oled.drawBox(nose_x - 4, 37, 5, 2);
+  else oled.drawBox(nose_x, 37, 5, 2);
+
+  drawMouth(mouth_x + mouth_off, mouth_mode, mouth_short);
+  drawGlasses(left_eye_x, right_eye_x, eye_y);   // 眼镜画在五官之上（视差/揉眼蹭动同步）
+
+  // 眉毛表情层（参考手绘稿）：惊讶=双眉高挑，好奇=单眉抬高，皱眉=狐疑/目送，
+  // 平静时随注意力漂移单眉轻挑 + 眨眼联动，让静止状态也"活着"。
+  int lift_l = 0, lift_r = 0, brow_inner = 0;
+  switch (state) {
+    case HM_APPROACH: lift_l = 3; lift_r = 3; break;  // 突然看到的惊讶
+    case HM_ACTIVE: break;                            // 开心：眉平（眼睛已变 ^、嘴变 D）
+    case HM_RETREAT:
+    case HM_GOODBYE:  brow_inner = 1; break;          // 后退/目送：眉头微皱
+    case HM_WAKING:   lift_l = lift_r = (int)(3 * constrain((now - state_since) / (float)WAKING_MS, 0.0f, 1.0f)); break;
+    case HM_SLEEP:    lift_l = lift_r = -1; break;    // 睡熟：眉放松下沉
+    case HM_IDLE: default:                            // 好奇：冷却通过的单次漂移才挑眉+歪嘴
+      if (smirk_granted) {
+        if (smirk_side > 0) { lift_r = 4; lift_l = 0; }
+        else { lift_l = 4; lift_r = 0; }
+      }
+      break;
+  }
+  if (blink_active && ev_cur == EV_NONE) {
+    if (blink_eye == 1 && lift_l > 0) lift_l -= 1;    // 眨眼侧眉毛轻压
+    if (blink_eye == 2 && lift_r > 0) lift_r -= 1;
+  }
+  int y0_l = 10 - lift_l + (blink_active && blink_eye == 1 ? 1 : 0);   // wink 侧再沉 1px
+  int y0_r = 10 - lift_r + (blink_active && blink_eye == 2 ? 1 : 0);
+  drawBrow(left_eye_x, y0_l, brow_inner, 1);
+  drawBrow(right_eye_x, y0_r, brow_inner, -1);
+
+  // 睡眠呼吸：亮度保持很低（宝盖质感的隐约可见），但不完全熄灭；渐暗事件期间做斜坡。
+  // 断雷达（深度待机）后进一步压暗到几乎不可见。
+  int contrast = 170;
+  if (state == HM_SLEEP) {
+    contrast = radar_powered ? 12 + (int)(face_breath * 20) : 6;
+  }
   if (ev_cur == EV_DIM) {
     float p = constrain((now - ev_started) / (float)BEDTIME_DIM_MS, 0.0f, 1.0f);
     contrast = (int)(170 - p * (170 - 45));
@@ -839,9 +1066,22 @@ void handleCommandLine(const char *command) {
     if (Serial && Serial.availableForWrite() > 32) {
       Serial.printf("DEBUG,%s\n", debug_overlay ? "ON" : "OFF");
     }
+  } else if (strcmp(command, "!FLIP") == 0) {
+    x_invert = !x_invert;
+    Preferences prefs;
+    prefs.begin("happymac", false);
+    prefs.putBool("x_invert", x_invert);
+    prefs.end();
+    if (Serial && Serial.availableForWrite() > 32) {
+      Serial.printf("FLIP,%s\n", x_invert ? "ON" : "OFF");
+    }
   } else if (strcmp(command, "!STATE") == 0) {
     if (Serial && Serial.availableForWrite() > 64) {
       Serial.printf("STATE,%lu,%s\n", millis(), stateName(state));
+    }
+  } else if (strcmp(command, "!PWR") == 0) {
+    if (Serial && Serial.availableForWrite() > 64) {
+      Serial.printf("PWR,radar=%d,screen_off=%d\n", radar_powered, screen_off);
     }
   }
 }
@@ -865,7 +1105,16 @@ void handleCommand() {
 
 void setup() {
   Serial.begin(115200);
+  // 雷达安装方向记忆：!FLIP 切换后写入 NVS，重启不丢
+  Preferences prefs;
+  prefs.begin("happymac", true);
+  x_invert = prefs.getBool("x_invert", x_invert);
+  prefs.end();
   pinMode(PIN_IR, INPUT);
+  pinMode(PIN_RADAR_PWR, OUTPUT);
+  digitalWrite(PIN_RADAR_PWR, HIGH);   // 上电默认雷达开启
+  gpio_hold_dis(GPIO_NUM_1);           // 唤醒重启后解除深度睡眠的电平锁存
+  gpio_deep_sleep_hold_dis();
   Wire.begin(PIN_SDA, PIN_SCL);
   // 与采集固件保持一致：GPIO8 同时挂着板载蓝灯和 OLED SDA，
   // 高速 I²C 容易造成偶发总线卡住；低速加超时优先保证主循环不死锁。
@@ -893,7 +1142,7 @@ void setup() {
 
   radar2450.begin(RADAR_BAUD, SERIAL_8N1, PIN_2450_RX, PIN_2450_TX);
   Serial.println("[2450] OK");
-  Serial.println("[HappyMac v0] T1b tree_d4 animation ready");
+  Serial.println("[HappyMac v" FW_VERSION "] T1b tree_d4 animation ready");
   changeState(HM_SLEEP);
 }
 
@@ -906,20 +1155,22 @@ void loop() {
   last_loop_ms = loop_start;
 
   handleCommand();
+  updatePower();   // 深度省电：决定雷达/屏幕供电状态（红外独守唤醒）
   readSensors();
   updateTinyML();
   updateState();
   updateAnimation();
 
   uint32_t now = millis();
-  if (now - last_display >= DISPLAY_MS) {
+  uint16_t disp_ms = (state == HM_SLEEP) ? 500 : DISPLAY_MS;   // 睡眠画面变化极慢：2Hz 刷新足够（替代 CPU 降频的省 CPU 手段）
+  if (now - last_display >= disp_ms) {
     last_display = now;
     drawFace();
   }
 
   // 保留轻量日志，方便初版装壳后的现场验证。
   static uint8_t radar_skip = 0;
-  if (Serial && ++radar_skip >= 2 && Serial.availableForWrite() > 120) {
+  if (Serial && debug_overlay && ++radar_skip >= 2 && Serial.availableForWrite() > 120) {   // 非调试模式不打雷达流：USB+CPU 常驻开销
     radar_skip = 0;
     Serial.printf("RADAR,%lu,%d,%d,%d,%d,%d,%d,%d,%d\n",
       now, r50_ok ? r50_x : 0, r50_ok ? r50_y : 0,
