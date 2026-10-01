@@ -234,6 +234,11 @@ const FW = { /* 与固件 #define 一一对应 */
   RADAR_OFF_AFTER_MS: 90000,   // SLEEP 后无人 90s → 断雷达电，只留红外待机
   SCREEN_OFF_AFTER_MS: 120000, // 断雷达后再 2min 无人 → 屏幕全黑
   RADAR_WARMUP_MS: 5000,       // 雷达上电预热（模拟器简化：不做预热门控）
+  R10_MOV_MIN_E: 15,           // 2410 运动存在能量门槛（幽灵存在修复，与固件 1:1）
+  R10_STAT_MIN_E: 20,          // 2410 静止存在能量门槛：空房底噪 8~10，真人静坐 30~40
+  DROWSY_AFTER_MS: 300000,     // 久坐犯困：有人但 5min 无运动 → 渐暗陪伴（雷达常开不关）
+  DROWSY_DIM_MS: 5000,         // 犯困渐暗斜坡
+  DROWSY_CONTRAST: 45,         // 犯困亮度下限
   WINK_COOLDOWN_MS: 45000,      // wink 最短间隔：特殊表情克制用
   WINK_COOLDOWN_JITTER: 45000,  // 附加随机 0~45s → 实际 45~90s 一次
   SMIRK_COOLDOWN_MS: 20000,     // 好奇歪嘴+单眉最短间隔
@@ -281,6 +286,7 @@ function createSimCore() {
   // ── 运动证据积分（对应 updateMotionEvidence）──
   let motion_ref_x = 0, motion_ref_y = 0, motion_ref_at = 0;
   let motion_score = 0, motion_stable = false;
+  let last_motion_at = 0, drowsy = false, drowsy_since = 0;
 
   // ── LD2410 / SR602 ──
   let r10_em = 0, r10_es = 0, r10_pres = false, ir_present = false;
@@ -363,6 +369,7 @@ function createSimCore() {
                      Math.abs(flt.x - motion_ref_x) > FW.MOTION_DELTA_MM ||
                      Math.abs(flt.y - motion_ref_y) > FW.MOTION_DELTA_MM;
     motion_score += evidence ? 1 : -1;
+    if (evidence) last_motion_at = t;
     motion_score = Math.max(0, Math.min(FW.MOTION_SCORE_MAX, motion_score));
     if (!motion_stable && motion_score >= FW.MOTION_ENTER_SCORE) motion_stable = true;
     else if (motion_stable && motion_score <= FW.MOTION_EXIT_SCORE) motion_stable = false;
@@ -372,8 +379,12 @@ function createSimCore() {
   }
 
   // ── 传感器层输入（由模拟器雷达模型/CSV 提供）──
-  function set2410(pres, em, es) { r10_pres = pres; r10_em = em; r10_es = es; }
-  function setIR(v) { ir_present = v; }
+  function set2410(pres, em, es) {
+    r10_em = em; r10_es = es;
+    // 幽灵存在修复（与固件 1:1）：检出标志 × 能量门槛
+    r10_pres = pres && (em >= FW.R10_MOV_MIN_E || es >= FW.R10_STAT_MIN_E);
+  }
+  function setIR(v) { ir_present = v; if (v) last_motion_at = t; }
 
   function sensorTick() { // 对应 readSensors() 的 2450 失联/衰减部分
     if (!radar_powered) {   // 红外独守待机：雷达数据全失效（断电反灌也随固件高阻消失）
@@ -725,7 +736,18 @@ function createSimCore() {
       if (!radar_powered) { radar_powered = true; log("PWR", "RADAR_ON"); }
     }
     if (state !== HM.SLEEP) { radar_powered = true; screen_off = false; }
-    contrast = state === HM.SLEEP ? (radar_powered ? 12 + face_breath * 20 : 6) : 170;
+    // 久坐犯困（与固件 updatePower 1:1）：有人但久无运动 → 渐暗陪伴；雷达常开不关
+    if (state === HM.IDLE && targetPresent()) {
+      const quiet = !motion_stable && !ir_present;
+      if (!drowsy && quiet && t - last_motion_at >= FW.DROWSY_AFTER_MS) { drowsy = true; drowsy_since = t; log("PWR", "DROWSY"); }
+      else if (drowsy && !quiet) { drowsy = false; log("PWR", "DROWSY_OFF"); }
+    } else if (drowsy) { drowsy = false; log("PWR", "DROWSY_OFF"); }
+    let base_contrast = 170;
+    if (drowsy) {
+      const p = Math.min((t - drowsy_since) / FW.DROWSY_DIM_MS, 1);
+      base_contrast = Math.round(170 - p * (170 - FW.DROWSY_CONTRAST));
+    }
+    contrast = state === HM.SLEEP ? (radar_powered ? 12 + face_breath * 20 : 6) : base_contrast;
     if (ev_cur === EV.DIM) {
       const p = Math.min((t - ev_started) / FW.BEDTIME_DIM_MS, 1);
       contrast = Math.round(170 - p * (170 - 45));
@@ -749,6 +771,7 @@ function createSimCore() {
     r50.ok = false; r50.seq = 0; r50.last = 0;
     flt = {x:0,y:0,v:0}; filter_ok = false; center_ok = false;
     motion_ref_at = 0; motion_score = 0; motion_stable = false;
+    last_motion_at = 0; drowsy = false; drowsy_since = 0;
     stable_presence = false; presence_candidate_since = 0;
     y_trend_ready = false; y_step_filtered = 0; y_trend_armed = true;
     ml_head = 0; ml_count = 0; ml_seq_seen = 0; ml_candidate = 255; ml_stable = 255;
@@ -771,6 +794,7 @@ function createSimCore() {
     get t(){return t}, get state(){return state}, get mlStable(){return ml_stable},
     get mlCandidate(){return ml_candidate}, get position(){return model_a_position},
     get motionScore(){return motion_score}, get motionStable(){return motion_stable},
+    get drowsy(){return drowsy},
     get yTrend(){return y_step_filtered}, get flt(){return flt}, get r50(){return r50},
     get faceLook(){return face_look}, get smiling(){return smiling},
     get openL(){return open_l}, get openR(){return open_r},

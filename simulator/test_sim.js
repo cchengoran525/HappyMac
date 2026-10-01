@@ -147,5 +147,39 @@ function flickerTest(legacy) {
   check("眼睛画在合理区域", fb.fb[23 * 128 + 38] === 1 || fb.fb[23 * 128 + 90] === 1);
 })();
 
+// ── 场景 6：幽灵存在修复 —— 只有低能量 2410（空房底噪 es≈9）时不再算“有人” ──
+(function () {
+  const core = createSimCore();
+  const radar = createRadarModel(core);
+  const events = [];
+  core.onLog = (tag, msg) => { if (tag === "st") events.push(msg.split(",")[2]); };
+  drive(core, radar, 3000, () => ({ x: 0, y: 900 }));
+  // 人走后 12s：2450 无目标帧、PIR 无、2410 只剩底噪（修复前这会把 presence 一直吊着）
+  for (let i = 0; i < 1200; i++) {
+    core.ingest2450Empty();
+    core.set2410(true, 0, 9);
+    core.setIR(false);
+    core.step(10);
+  }
+  check("幽灵底噪(es≈9)不再被当成有人 → 照常 GOODBYE", events.includes("GOODBYE"),
+    events.join(">"));
+  check("幽灵不阻止入睡", events.includes("SLEEP"), events.join(">"));
+})();
+
+// ── 场景 7：久坐犯困 —— 有人但 10min 无运动 → DROWSY 渐暗（雷达常开）；一动立刻恢复 ──
+(function () {
+  const core = createSimCore();
+  const radar = createRadarModel(core);
+  drive(core, radar, 5000, () => ({ x: 0, y: 2000 }));   // 到场坐下（y>1000：静坐不动时 PIR 为低，与真机一致）
+  drive(core, radar, 310000, () => ({ x: 0, y: 2000 })); // 静坐 310s（5min 犯困阈值 + 余量）
+  check("静坐 5min 进入犯困", core.drowsy === true, `drowsy=${core.drowsy}`);
+  drive(core, radar, 6000, () => ({ x: 0, y: 2000 }));   // 渐暗斜坡走完
+  check("犯困亮度压到陪伴值", core.contrast <= 50, `contrast=${core.contrast}`);
+  check("犯困期间屏幕未走灭屏流程", core.screenOff === false);
+  drive(core, radar, 1500, (dt) => ({ x: Math.sin(dt / 250 * Math.PI * 2) * 60, y: 2000, v: 20 }));
+  check("一动立刻醒来且恢复全亮", core.drowsy === false && core.contrast === 170,
+    `drowsy=${core.drowsy} contrast=${core.contrast}`);
+})();
+
 console.log(failed === 0 ? "\n全部通过 ✅" : `\n${failed} 项失败 ❌`);
 process.exit(failed === 0 ? 0 : 1);

@@ -9,7 +9,8 @@
   <a href="firmware/happymac_v0/元件尺寸台账.md">元件尺寸台账</a> |
   <a href="firmware/happymac_v0/README.md">固件文档</a> |
   <a href="simulator/happymac_sim.html">模拟器</a> |
-  <a href="firmware/power_test/power_test.ino">电源测试</a>
+  <a href="firmware/power_test/power_test.ino">电源测试</a> |
+  <a href="hardware/happymac_v01.stl">外壳 STL</a>
 </div>
 
 <br>

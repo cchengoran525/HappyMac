@@ -83,6 +83,8 @@
 #define MOTION_SCORE_MAX  8
 #define MOTION_ENTER_SCORE 4       // 连续约 0.5s 的证据才进入“在动”
 #define MOTION_EXIT_SCORE  1       // 持续安静后才退出“在动”
+#define R10_MOV_MIN_E      15      // 2410 运动存在能量门槛：低于此视为底噪（真实走动 30+，空房底噪 8~10）
+#define R10_STAT_MIN_E     20      // 2410 静止存在能量门槛：真人静坐 30~40，“幽灵”就是 8~10 的底噪过闸
 #define SMILE_ENTER_MS    600      // ACTIVE 持续这么久嘴才笑：短暂误进不闪嘴
 #define SMILE_MIN_MS      1500     // 笑容最短保持时间，防止嘴型反复横跳
 #define HAPPY_EYES_MS     800      // 笑开始时 ^ 眼的持续时间，之后眼睛恢复睁开（嘴继续笑）
@@ -94,7 +96,10 @@
 #define RADAR_OFF_AFTER_MS   90000   // SLEEP 后无人 90s → 断雷达电，只留红外待机
 #define SCREEN_OFF_AFTER_MS  120000  // 断雷达后再 2min 无人 → 屏幕全黑（SH1106 显示关闭）
 #define RADAR_WARMUP_MS      5000    // 雷达上电预热：期间数据不可信，只信红外
-#define DEEP_SLEEP_AFTER_MS  1800000 // 关屏后再 30min 无人 → 深度睡眠（PIR 唤醒=重启）
+#define DEEP_SLEEP_AFTER_MS  1200000 // 关屏后再 20min 无人 → 深度睡眠（PIR 唤醒=重启）
+#define DROWSY_AFTER_MS      300000  // 久坐犯困：有人但连续 5min 无运动 → 渐暗陪伴（雷达常开不关）
+#define DROWSY_DIM_MS        5000    // 犯困渐暗斜坡时长
+#define DROWSY_CONTRAST      45      // 犯困亮度下限（与睡前渐暗终点一致）
 #define BEDTIME_YAWN_AT   2500     // 无人 2.5s 后开始睡前链（在 GOODBYE 目送之后）
 #define BEDTIME_YAWN_MS   2000
 #define BEDTIME_RUB_MS    1500
@@ -125,6 +130,9 @@ float motion_ref_x = 0, motion_ref_y = 0;
 uint32_t motion_ref_at = 0;
 int8_t motion_score = 0;
 bool motion_stable = false;
+uint32_t last_motion_at = 0;   // 最近一次运动证据时刻（久坐犯困计时）
+bool drowsy = false;           // 久坐犯困态：在场但久无运动，屏渐暗、雷达常开
+uint32_t drowsy_since = 0;
 
 struct MlSample {
   uint32_t t;
@@ -277,6 +285,7 @@ void updateMotionEvidence() {
                   fabsf(flt_x - motion_ref_x) > MOTION_DELTA_MM ||
                   fabsf(flt_y - motion_ref_y) > MOTION_DELTA_MM;
   motion_score += evidence ? 1 : -1;
+  if (evidence) last_motion_at = now;
   if (motion_score < 0) motion_score = 0;
   if (motion_score > MOTION_SCORE_MAX) motion_score = MOTION_SCORE_MAX;
   if (!motion_stable && motion_score >= MOTION_ENTER_SCORE) {
@@ -393,10 +402,27 @@ void updatePower() {
     }
     if (!radar_powered) radarPowerOn();
   }
+
+  // 久坐犯困：有人但久无运动 → 渐暗陪伴；雷达常开（人在场不断电），一动/红外一闪即醒。
+  // quiet 判定刻意不含 r10_pres：幽灵存在不允许点亮或打断犯困。
+  if (state == HM_IDLE && targetPresent()) {
+    bool quiet = !motion_stable && !ir_present;
+    if (!drowsy && quiet && now - last_motion_at >= DROWSY_AFTER_MS) {
+      drowsy = true; drowsy_since = now;
+      if (Serial && Serial.availableForWrite() > 32) Serial.println("POWER,DROWSY");
+    } else if (drowsy && !quiet) {
+      drowsy = false;
+      if (Serial && Serial.availableForWrite() > 32) Serial.println("POWER,DROWSY_OFF");
+    }
+  } else if (drowsy) {
+    drowsy = false;
+    if (Serial && Serial.availableForWrite() > 32) Serial.println("POWER,DROWSY_OFF");
+  }
 }
 
 void readSensors() {
   ir_present = digitalRead(PIN_IR) == HIGH;
+  if (ir_present) last_motion_at = millis();   // 红外=运动证据，刷新久坐计时
   if (!radar_powered) {                    // 红外独守待机：两雷达断电，数据全失效
     r50_ok = false; r10_pres = false; r10_em = 0; r10_es = 0;
     if (!r50_ok && motion_score > 0) {
@@ -406,10 +432,11 @@ void readSensors() {
     return;
   }
   radar2410.read();
-  r10_pres = radar2410.movingTargetDetected() ||
-             radar2410.stationaryTargetDetected();
   r10_em = radar2410.movingTargetEnergy();
   r10_es = radar2410.stationaryTargetEnergy();
+  // 幽灵存在修复：库的检出标志连空房底噪（es 8~10）都会翻真，须乘能量门槛。
+  r10_pres = (radar2410.movingTargetDetected() && r10_em >= R10_MOV_MIN_E) ||
+             (radar2410.stationaryTargetDetected() && r10_es >= R10_STAT_MIN_E);
   ir_present = digitalRead(PIN_IR) == HIGH;
 
   parse2450();
@@ -1042,6 +1069,10 @@ void drawFace() {
   if (ev_cur == EV_DIM) {
     float p = constrain((now - ev_started) / (float)BEDTIME_DIM_MS, 0.0f, 1.0f);
     contrast = (int)(170 - p * (170 - 45));
+  }
+  if (drowsy) {   // 久坐犯困：慢斜坡压暗到陪伴亮度（与睡前渐暗同终点）
+    float p = constrain((now - drowsy_since) / (float)DROWSY_DIM_MS, 0.0f, 1.0f);
+    contrast = (int)(170 - p * (170 - DROWSY_CONTRAST));
   }
   if (contrast != oled_contrast &&
       (now - last_contrast_update >= 100 || oled_contrast < 0)) {
