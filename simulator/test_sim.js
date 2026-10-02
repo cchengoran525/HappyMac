@@ -181,5 +181,23 @@ function flickerTest(legacy) {
     `drowsy=${core.drowsy} contrast=${core.contrast}`);
 })();
 
+// ── 场景 8：双脸型 —— 经典版(default)无眼镜+初版长鼻+宽平嘴；朋友版=U 杯眼镜+短 J 鼻 ──
+(function () {
+  const core = createSimCore();
+  const radar = createRadarModel(core);
+  drive(core, radar, 2000, () => ({ x: 0, y: 900 }));   // look≈0：nose_x=64, eye_y=23
+  check("默认是经典版", core.faceFriend === false);
+  const fbC = createFB();
+  renderFace(fbC, core, false, core.faceFriend);
+  check("经典版：初版长鼻在 (64,30)", fbC.fb[30 * 128 + 64] === 1);
+  check("经典版：无 U 杯底杠 (52,31)", fbC.fb[31 * 128 + 52] !== 1);
+  check("经典版：初版宽平嘴 (50,51)", fbC.fb[51 * 128 + 50] === 1);
+  core.setStyle(true);
+  const fbF = createFB();
+  renderFace(fbF, core, false, core.faceFriend);
+  check("朋友版：U 杯底杠在 (52,31)", fbF.fb[31 * 128 + 52] === 1);
+  check("朋友版：长鼻换短 J 鼻 (64,30) 空", fbF.fb[30 * 128 + 64] !== 1);
+})();
+
 console.log(failed === 0 ? "\n全部通过 ✅" : `\n${failed} 项失败 ❌`);
 process.exit(failed === 0 ? 0 : 1);

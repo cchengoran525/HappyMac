@@ -112,6 +112,7 @@ HardwareSerial radar2450(0);
 // ─── LD2450 ──────────────────────────────────────────
 int16_t r50_x = 0, r50_y = 0, r50_v = 0;
 bool x_invert = true;  // 当前安装朝向下 raw x 与"偏左为负"约定相反，parse 时取反；重装雷达后若方向再反，串口 !FLIP 切换
+bool face_style_friend = false;  // 脸型：false=经典初版（无眼镜，特殊动作才出眉）作 default；true=一个戴眼镜的朋友版；串口 !STYLE 切换
 bool r50_ok = false;
 uint32_t r50_last = 0;
 float flt_x = 0, flt_y = 0;
@@ -852,6 +853,15 @@ void drawEye(int cx, int cy, int open, bool sleepy, int mode) {
 }
 
 void drawMouth(int cx, int mode, bool short_mouth) {
+  if (!face_style_friend && (mode == 0 || mode == 1)) {   // 经典版：初版平嘴 28×3 / 初版微笑（方角+斜线）
+    if (mode == 0) { oled.drawBox(cx - 14, 51, 28, 3); return; }
+    oled.drawRBox(cx - 22, 46, 5, 5, 1);
+    oled.drawRBox(cx + 17, 46, 5, 5, 1);
+    oled.drawBox(cx - 16, 51, 32, 4);
+    oled.drawLine(cx - 17, 50, cx - 16, 51);
+    oled.drawLine(cx + 16, 51, cx + 17, 50);
+    return;
+  }
   if (mode == 2) {                                  // 打哈欠的大 O 嘴（实心）
     oled.drawRBox(cx - 6, 44, 12, 11, 2);
     return;
@@ -883,6 +893,18 @@ void drawBrow(int cx, int y0, int inner, int dir) {
   oled.drawBox(cx - 9, y0, 19, 3);                              // 3px 厚横杠 19 宽
   oled.drawBox(cx - 9, y0 + 3, 2, 3 + (dir < 0 ? inner : 0));   // 外/内腿
   oled.drawBox(cx + 7, y0 + 3, 2, 3 + (dir > 0 ? inner : 0));
+}
+
+// 经典版眉毛（初版风格）：只在特殊动作出现；普通横线 1px，抬起侧画浅弧（拱顶再抬 lift/2）。
+void drawClassicBrow(int cx, int y0, int lift) {
+  if (lift <= 0) {
+    oled.drawLine(cx - 7, y0, cx + 7, y0);
+    return;
+  }
+  for (int x = -7; x <= 7; x++) {
+    float k = fabsf(x / 7.0f);
+    oled.drawPixel(cx + x, y0 - (int)(lift * 0.5f * (1.0f - k * k) + 0.5f));
+  }
 }
 
 // U 形杯眼镜（参考手绘稿）：29×2 粗底杠 + 两侧 2px 腿上延 10px + 小拱形桥连接两杯内腿。
@@ -1026,13 +1048,19 @@ void drawFace() {
   drawEye(left_eye_x, eye_y, open_l, sleepy, eye_mode_l);
   drawEye(right_eye_x, eye_y, open_r, sleepy, eye_mode_r);
 
-  // 小 J 鼻（参考手绘稿）：短竖 + 底部突出小脚，突出处朝人（nose_direction 已实测确认）。
-  oled.drawBox(nose_x - 1, 32, 3, 6);
-  if (nose_direction < 0) oled.drawBox(nose_x - 4, 37, 5, 2);
-  else oled.drawBox(nose_x, 37, 5, 2);
+  // 鼻子：朋友版=小 J 鼻（参考手绘稿）；经典版=初版长鼻 3×13 + 方向脚。
+  if (face_style_friend) {
+    oled.drawBox(nose_x - 1, 32, 3, 6);
+    if (nose_direction < 0) oled.drawBox(nose_x - 4, 37, 5, 2);
+    else oled.drawBox(nose_x, 37, 5, 2);
+  } else {
+    oled.drawBox(nose_x - 1, 26, 3, 13);
+    if (nose_direction < 0) oled.drawBox(nose_x - 7, 37, 8, 3);
+    else oled.drawBox(nose_x, 37, 8, 3);
+  }
 
   drawMouth(mouth_x + mouth_off, mouth_mode, mouth_short);
-  drawGlasses(left_eye_x, right_eye_x, eye_y);   // 眼镜画在五官之上（视差/揉眼蹭动同步）
+  if (face_style_friend) drawGlasses(left_eye_x, right_eye_x, eye_y);   // 经典版无眼镜
 
   // 眉毛表情层（参考手绘稿）：惊讶=双眉高挑，好奇=单眉抬高，皱眉=狐疑/目送，
   // 平静时随注意力漂移单眉轻挑 + 眨眼联动，让静止状态也"活着"。
@@ -1057,8 +1085,15 @@ void drawFace() {
   }
   int y0_l = 10 - lift_l + (blink_active && blink_eye == 1 ? 1 : 0);   // wink 侧再沉 1px
   int y0_r = 10 - lift_r + (blink_active && blink_eye == 2 ? 1 : 0);
-  drawBrow(left_eye_x, y0_l, brow_inner, 1);
-  drawBrow(right_eye_x, y0_r, brow_inner, -1);
+  if (face_style_friend) {
+    drawBrow(left_eye_x, y0_l, brow_inner, 1);
+    drawBrow(right_eye_x, y0_r, brow_inner, -1);
+  } else if ((state == HM_IDLE && smirk_granted) || state == HM_APPROACH ||
+             state == HM_RETREAT || state == HM_GOODBYE) {
+    // 经典版：眉毛只在特殊动作出现——好奇一高一低 / 凑近惊讶 / 目送皱眉；横线+浅弧
+    drawClassicBrow(left_eye_x, y0_l, lift_l);
+    drawClassicBrow(right_eye_x, y0_r, lift_r);
+  }
 
   // 睡眠呼吸：亮度保持很低（宝盖质感的隐约可见），但不完全熄灭；渐暗事件期间做斜坡。
   // 断雷达（深度待机）后进一步压暗到几乎不可见。
@@ -1114,6 +1149,15 @@ void handleCommandLine(const char *command) {
     if (Serial && Serial.availableForWrite() > 64) {
       Serial.printf("PWR,radar=%d,screen_off=%d\n", radar_powered, screen_off);
     }
+  } else if (strcmp(command, "!STYLE") == 0) {
+    face_style_friend = !face_style_friend;
+    Preferences prefs;
+    prefs.begin("happymac", false);
+    prefs.putBool("face_friend", face_style_friend);
+    prefs.end();
+    if (Serial && Serial.availableForWrite() > 32) {
+      Serial.printf("STYLE,%s\n", face_style_friend ? "FRIEND" : "CLASSIC");
+    }
   }
 }
 
@@ -1140,6 +1184,7 @@ void setup() {
   Preferences prefs;
   prefs.begin("happymac", true);
   x_invert = prefs.getBool("x_invert", x_invert);
+  face_style_friend = prefs.getBool("face_friend", face_style_friend);
   prefs.end();
   pinMode(PIN_IR, INPUT);
   pinMode(PIN_RADAR_PWR, OUTPUT);

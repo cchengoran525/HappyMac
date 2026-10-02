@@ -144,7 +144,7 @@
         <div class="row">
           <label class="sw"><input type="checkbox" id="swLegacy"> 旧版单帧判定</label>
           <label class="sw"><input type="checkbox" id="swDebug"> OLED 调试层</label>
-          <label class="sw"><input type="checkbox" id="swGlasses" checked> 半框眼镜</label>
+          <label class="sw"><input type="checkbox" id="swStyle"> 戴眼镜的朋友版</label>
         </div>
         <div class="row">
           <button id="btnCal">重校准 (!CAL)</button>
@@ -256,6 +256,8 @@ const STATE_NAMES = ["SLEEP","GOODBYE","WAKING","IDLE","ACTIVE","APPROACH","RETR
 const ML_NAMES = ["ABSENT","STILL","LATERAL","APPROACH","RETREAT"];
 const EV_NAMES = ["-","YAWN","RUB","DIM"];
 const POS_NAMES = ["CENTER","LEFT","RIGHT"];
+let face_friend = false;   // 脸型（顶层：renderFace/drawMouth 直接读）：false=经典初版(default) true=一个戴眼镜的朋友版
+const HM = { SLEEP:0, GOODBYE:1, WAKING:2, IDLE:3, ACTIVE:4, APPROACH:5, RETREAT:6 };
 
 /* tinyml_v0_tree_d4.h — sklearn DecisionTreeClassifier(max_depth=4) 原样移植 */
 function tinymlV0Predict(f) {
@@ -304,7 +306,6 @@ function createSimCore() {
   let ml_candidate = 255, ml_stable = 255, ml_candidate_since = 0;
 
   // ── 状态机 ──
-  const HM = { SLEEP:0, GOODBYE:1, WAKING:2, IDLE:3, ACTIVE:4, APPROACH:5, RETREAT:6 };
   let state = HM.SLEEP, previous_state = HM.SLEEP, state_since = 0;
   let had_target = false, last_seen = 0;
   let transient_until = 0, transient_cooldown_until = 0;
@@ -385,6 +386,7 @@ function createSimCore() {
     r10_pres = pres && (em >= FW.R10_MOV_MIN_E || es >= FW.R10_STAT_MIN_E);
   }
   function setIR(v) { ir_present = v; if (v) last_motion_at = t; }
+  function setStyle(v) { face_friend = !!v; }
 
   function sensorTick() { // 对应 readSensors() 的 2450 失联/衰减部分
     if (!radar_powered) {   // 红外独守待机：雷达数据全失效（断电反灌也随固件高阻消失）
@@ -794,7 +796,8 @@ function createSimCore() {
     get t(){return t}, get state(){return state}, get mlStable(){return ml_stable},
     get mlCandidate(){return ml_candidate}, get position(){return model_a_position},
     get motionScore(){return motion_score}, get motionStable(){return motion_stable},
-    get drowsy(){return drowsy},
+    get drowsy(){return drowsy}, setStyle,
+    get faceFriend(){return face_friend}, get smirkGranted(){return smirk_granted},
     get yTrend(){return y_step_filtered}, get flt(){return flt}, get r50(){return r50},
     get faceLook(){return face_look}, get smiling(){return smiling},
     get openL(){return open_l}, get openR(){return open_r},
@@ -876,20 +879,45 @@ function renderFace(fb, core, debugOverlay, glasses) {
   const eye_y = 23 + (core.eyeWiggle || 0);
   drawEye(fb, left_eye_x, eye_y, core.openL, core.sleepy, core.eyeModeL);
   drawEye(fb, right_eye_x, eye_y, core.openR, core.sleepy, core.eyeModeR);
-  // 小 J 鼻（参考手绘稿）：短竖 + 底部突出小脚，突出处朝人（noseDirection 已实测确认）。
-  fb.box(nose_x-1, 32, 3, 6);
-  if (core.noseDirection < 0) fb.box(nose_x-4, 37, 5, 2);
-  else fb.box(nose_x, 37, 5, 2);
+  // 鼻子：朋友版=小 J 鼻（参考手绘稿）；经典版=初版长鼻 3×13 + 方向脚。
+  if (face_friend) {
+    fb.box(nose_x-1, 32, 3, 6);
+    if (core.noseDirection < 0) fb.box(nose_x-4, 37, 5, 2);
+    else fb.box(nose_x, 37, 5, 2);
+  } else {
+    fb.box(nose_x-1, 26, 3, 13);
+    if (core.noseDirection < 0) fb.box(nose_x-7, 37, 8, 3);
+    else fb.box(nose_x, 37, 8, 3);
+  }
   drawMouth(fb, mouth_x + (core.mouthOff || 0), core.mouthMode, core.mouthShort);
   if (glasses) drawGlasses(fb, left_eye_x, right_eye_x, eye_y);
-  drawBrow(fb, left_eye_x, core.browYL, core.browInner, 1);
-  drawBrow(fb, right_eye_x, core.browYR, core.browInner, -1);
+  if (face_friend) {
+    drawBrow(fb, left_eye_x, core.browYL, core.browInner, 1);
+    drawBrow(fb, right_eye_x, core.browYR, core.browInner, -1);
+  } else {
+    // 经典版：眉毛只在特殊动作出现——好奇一高一低 / 凑近惊讶 / 目送皱眉；横线+浅弧
+    const st = core.state, sm = core.smirkGranted;
+    const special = st === HM.GOODBYE || st === HM.RETREAT || st === HM.APPROACH ||
+                    (st === HM.IDLE && sm);
+    if (special) {
+      drawClassicBrow(fb, left_eye_x, core.browYL, 10 - core.browYL);
+      drawClassicBrow(fb, right_eye_x, core.browYR, 10 - core.browYR);
+    }
+  }
 }
 function drawBrow(fb, cx, y0, inner, dir) {
   // 眉毛：宀 形粗眉（参考手绘稿）——3px 厚、19px 宽横杠 + 两端下腿；inner=1 内腿加长（皱眉）
   fb.box(cx-9, y0, 19, 3);
   fb.box(cx-9, y0+3, 2, 3 + (dir < 0 ? inner : 0));
   fb.box(cx+7, y0+3, 2, 3 + (dir > 0 ? inner : 0));
+}
+function drawClassicBrow(fb, cx, y0, lift) {
+  // 经典版眉毛（初版风格）：普通横线 1px；抬起侧画浅弧（拱顶再抬 lift/2）——横线和弧线
+  if (lift <= 0) { fb.line(cx-7, y0, cx+7, y0); return; }
+  for (let x = -7; x <= 7; x++) {
+    const k = Math.abs(x / 7);
+    fb.px(cx + x, y0 - Math.round(lift * 0.5 * (1 - k * k)));
+  }
 }
 function drawGlasses(fb, lcx, rcx, cy) {
   // U 形杯眼镜（参考手绘稿）：29×2 粗底杠 + 两侧 2px 腿上延 10px + 小拱形桥连接两杯内腿
@@ -928,8 +956,18 @@ function drawEye(fb, cx, cy, open, sleepy, mode) {
   }
   fb.rbox(cx-4, cy - Math.floor(h/2), 8, h);
 }
-function drawMouth(fb, cx, mode, short_mouth) {
-  if (mode === "yawn") { fb.rbox(cx-6, 44, 12, 11); return; }   // 打哈欠的大 O（实心）
+  function drawMouth(fb, cx, mode, short_mouth) {
+    const isFlat = mode !== "smile" && mode !== "yawn" && mode !== "o" && mode !== "arc";
+    if (!face_friend && (isFlat || mode === "smile")) {           // 经典版：初版平嘴 28×3 / 初版微笑（方角+斜线）
+      if (isFlat) { fb.box(cx-14, 51, 28, 3); return; }
+      fb.rbox(cx-22, 46, 5, 5);
+      fb.rbox(cx+17, 46, 5, 5);
+      fb.box(cx-16, 51, 32, 4);
+      fb.line(cx-17, 50, cx-16, 51);
+      fb.line(cx+16, 51, cx+17, 50);
+      return;
+    }
+    if (mode === "yawn") { fb.rbox(cx-6, 44, 12, 11); return; }   // 打哈欠的大 O（实心）
   if (mode === "o") { fb.rbox(cx-5, 45, 11, 10); return; }      // 惊讶方嘴：上下加高更明显（参考手绘稿）
   if (mode === "arc") {                                         // wink：用经典笑（宽条+两端小方角）
     fb.rbox(cx-22, 46, 5, 5);
@@ -1120,7 +1158,9 @@ if (typeof window !== "undefined" && typeof document !== "undefined") (function(
   const swNoise = document.getElementById("swNoise");
   const swLegacy = document.getElementById("swLegacy");
   const swDebug = document.getElementById("swDebug");
+  const swStyle = document.getElementById("swStyle");
   swLegacy.onchange = () => { core.legacy = swLegacy.checked; };
+  swStyle.onchange = () => { core.setStyle(swStyle.checked); };   // false=经典初版(default) true=戴眼镜的朋友版
   document.getElementById("btnCal").onclick = () => core.calibrate();
   let paused = false;
   document.getElementById("btnPause").onclick = e => { paused = !paused; e.target.textContent = paused ? "继续" : "暂停"; };
@@ -1254,7 +1294,7 @@ if (typeof window !== "undefined" && typeof document !== "undefined") (function(
     display_acc += dt;
     if (display_acc >= FW.DISPLAY_MS || trailDrawDirty) {
       display_acc = 0; trailDrawDirty = false;
-      renderFace(fb, core, swDebug.checked, swGlasses.checked);
+      renderFace(fb, core, swDebug.checked, core.faceFriend);
       const img = octx.createImageData(128,64);
       const lum = Math.max(0.16, Math.min(1, core.contrast/170));
       for (let i=0;i<128*64;i++) {
