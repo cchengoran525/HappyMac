@@ -1,5 +1,8 @@
 <div align="center">
-  <img src="assets/happymac_banner.svg?v=2" width="800" alt="HappyMac — 一枚会陪你熬夜的赛博小生命"/>
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/happymac_banner_dark.svg">
+    <img src="assets/happymac_banner.svg" width="800" alt="HappyMac — 一枚会陪你熬夜的赛博小生命"/>
+  </picture>
 </div>
 
 <br>
